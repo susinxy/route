@@ -890,14 +890,22 @@ class SimulatedAnnealing:
             if current_overlap > 0.01:
                 # 更强的重叠惩罚，迫使快速消除重叠
                 overlap_lambda = 50000.0 * (1 + progress * 100)
+                area_lambda = 0.0
             else:
                 overlap_lambda = 0.0
+                # Area penalty: increase over time, especially in deep optimization
+                # Phase 1 (0-0.3): no area penalty, focus on HPWL
+                # Phase 2 (0.3-1.0): gradually increase area penalty
+                if progress < 0.3:
+                    area_lambda = 0.0
+                else:
+                    area_lambda = 0.5 + (progress - 0.3) * 1.0  # 0.5 -> 1.2
 
             new_arr = self._perturb(current_arr, temperature, max_temp, layout_scale)
             new_x, new_y = self._decode_fast(new_arr)
             new_total, new_hpwl, new_area, new_overlap = \
                 compute_cost(self.problem, new_x, new_y, overlap_lambda)
-            new_real_cost = 10 * new_hpwl + new_area
+            new_real_cost = 10 * new_hpwl + new_area + area_lambda * new_area
 
             current_total = current_real_cost + overlap_lambda * current_overlap
             delta = new_total - current_total
@@ -1005,45 +1013,68 @@ def _compress_layout(problem: Problem, cs: ConstraintSystem,
     
     print(f"    压缩前: cost={best_cost:.1f}, area={area0:.1f}, hpwl={hpwl0:.1f}, overlap={overlap0:.2f}")
     
-    # 保守策略：小幅缩放，只接受改善
+    # 改进策略：独立缩放x和y方向，更细粒度搜索
     improved = True
     iteration = 0
     
-    while improved and time.time() - t0 < remaining_time * 0.9 and iteration < 20:
+    while improved and time.time() - t0 < remaining_time * 0.9 and iteration < 30:
         improved = False
         iteration += 1
         
-        # 尝试不同缩放比例
-        for scale in [0.98, 0.96, 0.95, 1.02, 1.05]:
-            if time.time() - t0 > remaining_time * 0.9:
-                break
-            
-            # 缩放变量值（向质心缩放）
+        # 尝试不同缩放比例组合（x和y独立）
+        scales_x = [0.99, 0.98, 0.97, 0.96, 0.95, 1.00, 1.01, 1.02]
+        scales_y = [0.99, 0.98, 0.97, 0.96, 0.95, 1.00, 1.01, 1.02]
+        
+        best_scale_combo = None
+        best_scale_cost = best_cost
+        
+        for sx in scales_x:
+            for sy in scales_y:
+                if sx == 1.00 and sy == 1.00:
+                    continue
+                if time.time() - t0 > remaining_time * 0.85:
+                    break
+                
+                # 分别缩放x和y方向的变量
+                new_arr = current_arr.copy()
+                # 简化：统一缩放（因为变量混合了x和y）
+                scale = (sx + sy) / 2.0
+                centroid = np.mean(current_arr)
+                new_arr = centroid + (current_arr - centroid) * scale
+                
+                new_x, new_y = cs.decode(
+                    {fv: float(new_arr[j]) for j, fv in enumerate(free_vars)})
+                
+                # 检查重叠
+                overlap = compute_overlap_penalty(problem, new_x, new_y)
+                if overlap > 15.0:  # 允许少量重叠
+                    continue
+                
+                _, new_hpwl, new_area, new_overlap = compute_cost(problem, new_x, new_y)
+                new_cost = 10 * new_hpwl + new_area
+                
+                # 如果改善超过0.5%，记录下来
+                if new_cost < best_scale_cost * 0.995:
+                    best_scale_cost = new_cost
+                    best_scale_combo = (sx, sy)
+        
+        # 应用最佳缩放
+        if best_scale_combo is not None:
+            sx, sy = best_scale_combo
+            scale = (sx + sy) / 2.0
             centroid = np.mean(current_arr)
-            new_arr = centroid + (current_arr - centroid) * scale
+            current_arr = centroid + (current_arr - centroid) * scale
             
-            new_x, new_y = cs.decode(
-                {fv: float(new_arr[j]) for j, fv in enumerate(free_vars)})
+            best_x, best_y = cs.decode(
+                {fv: float(current_arr[j]) for j, fv in enumerate(free_vars)})
             
-            # 检查重叠
-            overlap = compute_overlap_penalty(problem, new_x, new_y)
-            if overlap > 10.0:  # 容忍度比之前高
-                continue
+            _, new_hpwl, new_area, new_overlap = compute_cost(problem, best_x, best_y)
+            best_cost = best_scale_cost
+            improved = True
             
-            _, new_hpwl, new_area, new_overlap = compute_cost(problem, new_x, new_y)
-            new_cost = 10 * new_hpwl + new_area
-            
-            # 只有当cost确实改善时才接受
-            if new_cost < best_cost * 0.99:  # 至少改善1%才值得
-                best_cost = new_cost
-                best_x = new_x.copy()
-                best_y = new_y.copy()
-                best_arr = new_arr.copy()
-                improved = True
-                print(f"    压缩 iter={iteration}, scale={scale:.2f}: "
-                      f"cost={new_cost:.1f}, area={new_area:.1f}, hpwl={new_hpwl:.1f}, "
-                      f"overlap={new_overlap:.2f}")
-                break  # 接受这个缩放，进入下一轮迭代
+            print(f"    压缩 iter={iteration}, scale=({sx:.2f},{sy:.2f}): "
+                  f"cost={best_cost:.1f}, area={new_area:.1f}, hpwl={new_hpwl:.1f}, "
+                  f"overlap={new_overlap:.2f}")
     
     print(f"    压缩后: cost={best_cost:.1f}, 改善={100*(1-best_cost/(10*hpwl0+area0)):.1f}%")
     return best_x, best_y
