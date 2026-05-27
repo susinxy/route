@@ -845,7 +845,7 @@ class SimulatedAnnealing:
             elapsed = time.time() - t0
             print(f"    [轮 {round_num}] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
 
-        # 阶段2:深度优化最好的解
+        # 阶段2:深度优化最好的解(单次长轮)
         print(f"  [阶段2] 深度优化最佳初始解...")
         if best_initial_arr is not None:
             remaining = self.time_limit - (time.time() - t0)
@@ -888,7 +888,8 @@ class SimulatedAnnealing:
 
             progress = (time.time() - local_t0) / time_budget
             if current_overlap > 0.01:
-                overlap_lambda = 5000.0 * (1 + progress * 50)
+                # 更强的重叠惩罚，迫使快速消除重叠
+                overlap_lambda = 50000.0 * (1 + progress * 100)
             else:
                 overlap_lambda = 0.0
 
@@ -959,88 +960,92 @@ class SimulatedAnnealing:
 # 求解入口
 # ============================================================
 
-def _compress_layout(problem: Problem, cs: ConstraintSystem,
+def _compress_layout(problem: Problem, cs: ConstraintSystem, 
                      x_coords: List[float], y_coords: List[float],
                      remaining_time: float = 5.0) -> Tuple[List[float], List[float]]:
     """
-    全局压缩后处理:尝试缩小组合框面积
-    策略:分别压缩 x 和 y 方向的极值
+    全局压缩后处理：仅在能改善总成本时应用
+    
+    策略：
+    1. 小幅缩放（0.95-1.05）变量值
+    2. 只有当新cost < 原cost时才接受
+    3. 迭代尝试直到时间用尽或无改善
     """
     import numpy as np
     t0 = time.time()
-
+    
     n = problem.n
     free_vars = sorted(cs.free_vars)
     num_vars = len(free_vars)
-
+    
     # 反推当前变量值
     A = np.zeros((2 * n, num_vars))
-    b = np.zeros(2 * n)
-
+    b_vec = np.zeros(2 * n)
+    
     for i in range(n):
         expr_x = cs.var_exprs[i]
         for j, fv in enumerate(free_vars):
             A[i, j] = expr_x.coeffs.get(fv, 0.0)
-        b[i] = x_coords[i] - expr_x.const
-
+        b_vec[i] = x_coords[i] - expr_x.const
+        
         expr_y = cs.var_exprs[n + i]
         for j, fv in enumerate(free_vars):
             A[n + i, j] = expr_y.coeffs.get(fv, 0.0)
-        b[n + i] = y_coords[i] - expr_y.const
-
-    result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-    current_values = {fv: float(result[j]) for j, fv in enumerate(free_vars)}
-
-    best_values = current_values.copy()
+        b_vec[n + i] = y_coords[i] - expr_y.const
+    
+    result, _, _, _ = np.linalg.lstsq(A, b_vec, rcond=None)
+    current_arr = result.copy()
+    
+    # 计算当前cost
+    _, hpwl0, area0, overlap0 = compute_cost(problem, x_coords, y_coords)
+    best_cost = 10 * hpwl0 + area0
     best_x = x_coords.copy()
     best_y = y_coords.copy()
-
-    # 计算当前面积
-    min_x = min(best_x)
-    max_x = max(best_x[i] + problem.widths[i] for i in range(n))
-    min_y = min(best_y)
-    max_y = max(best_y[i] + problem.heights[i] for i in range(n))
-    best_area = (max_x - min_x) * (max_y - min_y)
-
-    # 尝试不同压缩比例
-    compression_ratios = [0.95, 0.90, 0.85, 0.80, 0.75]
-
-    for ratio in compression_ratios:
-        if time.time() - t0 > remaining_time * 0.5:
-            break
-
-        # 压缩 x 方向
-        new_values = current_values.copy()
-        center_x = (min_x + max_x) / 2
-        for i in range(n):
-            expr_x = cs.var_exprs[i]
-            current_x = best_x[i]
-            # 向中心压缩
-            target_x = center_x + (current_x - center_x) * ratio
-            # 反推变量值(简化:直接缩放)
-            for fv in free_vars:
-                coeff = expr_x.coeffs.get(fv, 0.0)
-                if abs(coeff) > 1e-6:
-                    new_values[fv] *= ratio
-                    break
-
-        new_x, new_y = cs.decode(new_values)
-
-        # 检查重叠
-        overlap = compute_overlap_penalty(problem, new_x, new_y)
-        if overlap < 1e-3:  # 无重叠
-            new_min_x = min(new_x)
-            new_max_x = max(new_x[i] + problem.widths[i] for i in range(n))
-            new_min_y = min(new_y)
-            new_max_y = max(new_y[i] + problem.heights[i] for i in range(n))
-            new_area = (new_max_x - new_min_x) * (new_max_y - new_min_y)
-
-            if new_area < best_area:
-                best_values = new_values.copy()
+    best_arr = current_arr.copy()
+    
+    print(f"    压缩前: cost={best_cost:.1f}, area={area0:.1f}, hpwl={hpwl0:.1f}, overlap={overlap0:.2f}")
+    
+    # 保守策略：小幅缩放，只接受改善
+    improved = True
+    iteration = 0
+    
+    while improved and time.time() - t0 < remaining_time * 0.9 and iteration < 20:
+        improved = False
+        iteration += 1
+        
+        # 尝试不同缩放比例
+        for scale in [0.98, 0.96, 0.95, 1.02, 1.05]:
+            if time.time() - t0 > remaining_time * 0.9:
+                break
+            
+            # 缩放变量值（向质心缩放）
+            centroid = np.mean(current_arr)
+            new_arr = centroid + (current_arr - centroid) * scale
+            
+            new_x, new_y = cs.decode(
+                {fv: float(new_arr[j]) for j, fv in enumerate(free_vars)})
+            
+            # 检查重叠
+            overlap = compute_overlap_penalty(problem, new_x, new_y)
+            if overlap > 10.0:  # 容忍度比之前高
+                continue
+            
+            _, new_hpwl, new_area, new_overlap = compute_cost(problem, new_x, new_y)
+            new_cost = 10 * new_hpwl + new_area
+            
+            # 只有当cost确实改善时才接受
+            if new_cost < best_cost * 0.99:  # 至少改善1%才值得
+                best_cost = new_cost
                 best_x = new_x.copy()
                 best_y = new_y.copy()
-                best_area = new_area
-
+                best_arr = new_arr.copy()
+                improved = True
+                print(f"    压缩 iter={iteration}, scale={scale:.2f}: "
+                      f"cost={new_cost:.1f}, area={new_area:.1f}, hpwl={new_hpwl:.1f}, "
+                      f"overlap={new_overlap:.2f}")
+                break  # 接受这个缩放，进入下一轮迭代
+    
+    print(f"    压缩后: cost={best_cost:.1f}, 改善={100*(1-best_cost/(10*hpwl0+area0)):.1f}%")
     return best_x, best_y
 
 
@@ -1074,14 +1079,14 @@ def solve(problem: Problem, time_limit: float = 115.0,
         print("后处理: 去重叠微调...")
         x_coords, y_coords = _postprocess(problem, cs, x_coords, y_coords,
                                            remaining_time=remaining)
-    
+
     # 4. 全局压缩后处理
     remaining = time_limit - (time.time() - t0)
     if remaining > 2.0:
         print("后处理: 全局压缩...")
         x_coords, y_coords = _compress_layout(problem, cs, x_coords, y_coords,
                                               remaining_time=remaining)
-    
+
     # 5. 验证
     violations = validate_layout(problem, x_coords, y_coords)
     elapsed = time.time() - t0
