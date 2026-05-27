@@ -1,162 +1,178 @@
 """
-主入口
+主入口：读取输入 → 调用算法 → 输出结果
+
+支持单用例和多用例批量执行。
 
 用法:
-  python main.py input.json          # 从文件读取输入
-  python main.py -t                  # 运行内置测试用例
-  python main.py -t --time 30        # 指定时间限制
+  python main.py input.json [--time 115]          # 单用例
+  python main.py case1.json case2.json [--time 115]  # 多用例
+  python main.py -d ./cases [--time 115]          # 目录下所有 JSON
+  python main.py -t [--time 30]                   # 内置测试用例
 """
 import json
 import sys
-import time
 import os
+import glob
+from typing import List, Dict, Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models import Problem
-from constraint_system import ConstraintSystem
-from sa import SimulatedAnnealing
-from evaluator import compute_cost, count_overlaps
-from validator import validate_and_report
+from route import Problem, solve
 
 
-def solve(problem: Problem, time_limit: float = 115.0) -> dict:
-    t0 = time.time()
+def main():
+    time_limit = 115.0
+    input_files = []
 
-    # 1. 约束化简
-    cs = ConstraintSystem(problem)
+    # 解析命令行参数：过滤掉 --xxx 及其值
+    args = []
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i].startswith("--"):
+            i += 2  # 跳过 --key 和 value
+        else:
+            args.append(sys.argv[i])
+            i += 1
+    
+    if "--time" in sys.argv:
+        idx = sys.argv.index("--time")
+        if idx + 1 < len(sys.argv):
+            time_limit = float(sys.argv[idx + 1])
 
-    # 2. 模拟退火优化
-    sa = SimulatedAnnealing(problem, cs, time_limit=time_limit)
-    x_coords, y_coords, cost = sa.run()
+    # 处理输入源
+    if "-t" in args:
+        # 内置测试用例
+        run_single_case(_builtin_test_case(), time_limit, "builtin_test")
+        return
+    
+    if "-d" in args:
+        # 目录下所有 JSON
+        idx = args.index("-d")
+        if idx + 1 < len(args):
+            dir_path = args[idx + 1]
+            input_files = sorted(glob.glob(os.path.join(dir_path, "*.json")))
+            if not input_files:
+                print(f"错误: 目录 {dir_path} 中没有找到 JSON 文件")
+                sys.exit(1)
+        else:
+            print("错误: -d 需要指定目录路径")
+            sys.exit(1)
+    else:
+        # 单个或多个文件
+        input_files = args
 
-    # 3. 后处理：去重叠微调
-    print("\n后处理: 去重叠微调...")
-    x_coords, y_coords = _postprocess(problem, cs, x_coords, y_coords,
-                                       remaining_time=time_limit - (time.time() - t0))
+    if not input_files:
+        print("Usage:")
+        print("  python main.py input.json [--time 115]")
+        print("  python main.py case1.json case2.json [--time 115]")
+        print("  python main.py -d ./cases [--time 115]")
+        print("  python main.py -t [--time 30]")
+        sys.exit(1)
 
-    # 4. 验证
-    is_valid, violations = validate_and_report(problem, x_coords, y_coords)
+    # 批量执行
+    if len(input_files) == 1:
+        # 单用例模式
+        with open(input_files[0], "r") as f:
+            data = json.load(f)
+        run_single_case(data, time_limit, os.path.basename(input_files[0]))
+    else:
+        # 多用例模式
+        print(f"=== 批量执行 {len(input_files)} 个用例 ===")
+        print(f"时间限制: {time_limit}s/用例\n")
+        
+        results = []
+        for i, filepath in enumerate(input_files, 1):
+            print(f"\n{'='*60}")
+            print(f"用例 {i}/{len(input_files)}: {os.path.basename(filepath)}")
+            print('='*60)
+            
+            try:
+                with open(filepath, "r") as f:
+                    data = json.load(f)
+                result = run_single_case(data, time_limit, os.path.basename(filepath))
+                results.append((os.path.basename(filepath), result))
+            except Exception as e:
+                print(f"❌ 执行失败: {e}")
+                results.append((os.path.basename(filepath), None))
 
-    elapsed = time.time() - t0
-    _, hpwl, area, overlap = compute_cost(problem, x_coords, y_coords)
-    real_cost = 10 * hpwl + area
+        # 汇总报告
+        print_summary(results)
 
-    # 5. 构建输出
-    box_position = []
-    for i in range(problem.n):
-        box_position.append([round(x_coords[i], 4), round(y_coords[i], 4)])
 
-    result = {
-        "box_position": box_position,
-        "cost": round(real_cost, 4),
-        "hpwl": round(hpwl, 4),
-        "area": round(area, 4),
-        "overlap": round(overlap, 4),
-        "violations": violations,
-        "elapsed_seconds": round(elapsed, 2),
-        "sa_iterations": sa.iterations,
-    }
+def run_single_case(data: Dict[str, Any], time_limit: float, case_name: str) -> Dict[str, Any]:
+    """执行单个用例，返回结果"""
+    print(f"输入: {len(data['box_size'])} 个矩形, "
+          f"{len(data.get('nets', []))} 个网络")
+    print(f"时间限制: {time_limit}s\n")
+
+    problem = Problem(data)
+    result = solve(problem, time_limit=time_limit)
+
+    print(f"\n=== 结果 ===")
+    print(f"Cost:    {result['cost']}")
+    print(f"  HPWL:  {result['hpwl']}")
+    print(f"  Area:  {result['area']}")
+    print(f"  Overlap: {result['overlap']}")
+    print(f"耗时:    {result['elapsed_seconds']}s")
+
+    # 保存输出
+    output = {"box_position": result["box_position"]}
+    output_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        f"output_{case_name.replace('.json', '')}.json"
+    )
+    with open(output_path, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\n输出已保存到 {output_path}")
+
     return result
 
 
-def _postprocess(problem, cs, x_coords, y_coords, remaining_time=10.0):
-    """
-    后处理：在约束满足的前提下，通过微调独立变量消除残余重叠。
-    """
-    import numpy as np
-    from evaluator import compute_overlap_penalty
+def print_summary(results: List[tuple]):
+    """打印批量执行汇总"""
+    print(f"\n\n{'='*60}")
+    print("=== 批量执行汇总 ===")
+    print('='*60)
+    print(f"{'用例':<30} {'Cost':>12} {'HPWL':>10} {'Area':>12} {'Overlap':>10} {'耗时':>8}")
+    print('-'*60)
 
-    n = problem.n
-    free_vars = sorted(cs.free_vars)
-    num_vars = len(free_vars)
+    success_count = 0
+    total_cost = 0
+    total_time = 0
 
-    # 反推当前独立变量值
-    A = np.zeros((2 * n, num_vars))
-    b = np.zeros(2 * n)
+    for case_name, result in results:
+        if result is None:
+            print(f"{case_name:<30} {'FAILED':>12}")
+            continue
+        
+        success_count += 1
+        total_cost += result['cost']
+        total_time += result['elapsed_seconds']
+        
+        print(f"{case_name:<30} {result['cost']:>12.1f} "
+              f"{result['hpwl']:>10.1f} {result['area']:>12.1f} "
+              f"{result['overlap']:>10.1f} {result['elapsed_seconds']:>7.1f}s")
 
-    for i in range(n):
-        expr_x = cs.var_exprs[i]
-        for j, fv in enumerate(free_vars):
-            A[i, j] = expr_x.coeffs.get(fv, 0.0)
-        b[i] = x_coords[i] - expr_x.const
-
-        expr_y = cs.var_exprs[n + i]
-        for j, fv in enumerate(free_vars):
-            A[n + i, j] = expr_y.coeffs.get(fv, 0.0)
-        b[n + i] = y_coords[i] - expr_y.const
-
-    result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-    current_values = {fv: float(result[j]) for j, fv in enumerate(free_vars)}
-
-    # 迭代去重叠
-    best_values = current_values.copy()
-    best_overlap = compute_overlap_penalty(problem, x_coords, y_coords)
-    best_x = x_coords.copy()
-    best_y = y_coords.copy()
-
-    t0 = time.time()
-    max_dim = max(max(problem.widths), max(problem.heights))
-    step = max_dim * 0.5
-
-    for iteration in range(10000):
-        if time.time() - t0 > min(remaining_time, 15.0):
-            break
-
-        new_values = current_values.copy()
-        var = free_vars[iteration % num_vars]
-        delta = step * (1 if iteration % 2 == 0 else -1) * (0.5 + 0.5 * np.random.random())
-        new_values[var] += delta
-
-        new_x, new_y = cs.decode(new_values)
-        new_overlap = compute_overlap_penalty(problem, new_x, new_y)
-
-        if new_overlap < best_overlap:
-            best_overlap = new_overlap
-            best_values = new_values.copy()
-            best_x = new_x.copy()
-            best_y = new_y.copy()
-            current_values = new_values
-
-            if new_overlap < 0.001:
-                break
-
-        step *= 0.999
-
-    return best_x, best_y
+    print('-'*60)
+    if success_count > 0:
+        print(f"成功: {success_count}/{len(results)}")
+        print(f"平均 Cost: {total_cost/success_count:.1f}")
+        print(f"总耗时: {total_time:.1f}s")
+    print('='*60)
 
 
-def generate_test_case() -> dict:
-    """
-    可行测试用例：
-    - 12 个矩形
-    - 对称约束（不冲突）
-    - 对齐约束（不导致必然重叠）
-    - 网络连接
-    """
+def _builtin_test_case() -> dict:
     return {
         "box_size": [
-            [6, 4],    # 1
-            [3, 5],    # 2
-            [4, 2],    # 3
-            [4, 2],    # 4
-            [8, 6],    # 5
-            [8, 6],    # 6
-            [6, 6],    # 7
-            [6, 6],    # 8
-            [4, 2],    # 9
-            [4, 2],    # 10
-            [5, 3],    # 11
-            [8, 4],    # 12
+            [6, 4], [3, 5], [4, 2], [4, 2], [8, 6], [8, 6],
+            [6, 6], [6, 6], [4, 2], [4, 2], [5, 3], [8, 4],
         ],
-        # 简化对称约束，避免冲突
         "symmetry_x": [
             {"symmetry_pair": [[5, 6], [3, 4]], "self_symmetry": [1]}
         ],
         "symmetry_y": [
             {"symmetry_pair": [[7, 8]], "self_symmetry": [2]}
         ],
-        # 简化对齐约束
         "align": {
             "left": [[1, 3]],
             "right": [],
@@ -164,57 +180,8 @@ def generate_test_case() -> dict:
             "bottom": [[1, 7, 2]]
         },
         "repeat_groups": [],
-        "nets": [
-            [1, 2, 3, 4, 5],
-            [2, 6, 8],
-            [10, 12]
-        ]
+        "nets": [[1, 2, 3, 4, 5], [2, 6, 8], [10, 12]]
     }
-
-
-def main():
-    time_limit = 115.0
-
-    if len(sys.argv) < 2:
-        print("Usage: python main.py <input.json> | python main.py -t [--time N]")
-        sys.exit(1)
-
-    if sys.argv[1] == "-t":
-        data = generate_test_case()
-        if "--time" in sys.argv:
-            idx = sys.argv.index("--time")
-            if idx + 1 < len(sys.argv):
-                time_limit = float(sys.argv[idx + 1])
-    else:
-        with open(sys.argv[1], "r") as f:
-            data = json.load(f)
-        if "--time" in sys.argv:
-            idx = sys.argv.index("--time")
-            if idx + 1 < len(sys.argv):
-                time_limit = float(sys.argv[idx + 1])
-
-    print(f"输入: {len(data['box_size'])} 个矩形, "
-          f"{len(data.get('nets', []))} 个网络")
-    print(f"时间限制: {time_limit}s")
-
-    problem = Problem(data)
-    result = solve(problem, time_limit=time_limit)
-
-    print(f"\n=== 结果 ===")
-    print(f"Cost: {result['cost']}")
-    print(f"  HPWL: {result['hpwl']}")
-    print(f"  Area: {result['area']}")
-    print(f"  Overlap: {result['overlap']}")
-    print(f"耗时: {result['elapsed_seconds']}s")
-    print(f"SA迭代: {result['sa_iterations']}")
-
-    output = {"box_position": result["box_position"]}
-    output_path = "output.json"
-    with open(output_path, "w") as f:
-        json.dump(output, f, indent=2)
-    print(f"\n输出已保存到 {output_path}")
-
-    return result
 
 
 if __name__ == "__main__":
