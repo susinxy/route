@@ -693,12 +693,55 @@ class SimulatedAnnealing:
         box_scale = sorted(all_dims)[len(all_dims) // 2]
 
         r = random.random()
-        if r < 0.08 and self.best_overlap < 0.01:
+        if r < 0.15 and self.best_overlap < 0.01:
             # Compression move: scale all vars toward center of mass
-            factor = 1.0 - random.uniform(0.003, 0.02)
+            factor = 1.0 - random.uniform(0.005, 0.03)
             center = np.mean(new_vars)
             new_vars = center + (new_vars - center) * factor
-        elif r < 0.20:
+        elif r < 0.25:
+            # Area-focused move: shrink boundary boxes toward center
+            x, y = self._decode_fast(new_vars)
+            w, h = self.problem.widths, self.problem.heights
+            
+            # Find bounding box
+            min_x = min(x)
+            max_x = max(x[i] + w[i] for i in range(len(x)))
+            min_y = min(y)
+            max_y = max(y[i] + h[i] for i in range(len(y)))
+            
+            center_x = (min_x + max_x) / 2
+            center_y = (min_y + max_y) / 2
+            
+            # Identify boundary boxes (within 20% of edges)
+            margin_x = (max_x - min_x) * 0.2
+            margin_y = (max_y - min_y) * 0.2
+            
+            boundary_boxes = []
+            for i in range(len(x)):
+                box_cx = x[i] + w[i] / 2
+                box_cy = y[i] + h[i] / 2
+                if (box_cx < min_x + margin_x or box_cx > max_x - margin_x or
+                    box_cy < min_y + margin_y or box_cy > max_y - margin_y):
+                    boundary_boxes.append(i)
+            
+            if boundary_boxes:
+                # Move 1-2 boundary boxes toward center
+                num_to_move = min(random.randint(1, 2), len(boundary_boxes))
+                selected = random.sample(boundary_boxes, num_to_move)
+                
+                shrink_factor = random.uniform(0.1, 0.3)
+                target_x_arr = list(x)
+                target_y_arr = list(y)
+                
+                for box_id in selected:
+                    # Move toward center
+                    target_x_arr[box_id] = x[box_id] + (center_x - x[box_id]) * shrink_factor
+                    target_y_arr[box_id] = y[box_id] + (center_y - y[box_id]) * shrink_factor
+                
+                new_vars = self._fit_to_target(target_x_arr, target_y_arr)
+            else:
+                self._standard_perturb(new_vars, ratio, box_scale)
+        elif r < 0.35:
             # Smart move: move a box toward center of its connected neighbors
             x, y = self._decode_fast(new_vars)
             box_id = random.randint(0, self.problem.n - 1)
