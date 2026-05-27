@@ -8,6 +8,20 @@
   python main.py case1.json case2.json [--time 115]  # 多用例
   python main.py -d ./cases [--time 115]          # 目录下所有 JSON
   python main.py -t [--time 30]                   # 内置测试用例
+  
+初始化策略选项:
+  --strategies s1,s2,s3    指定策略序列（逗号分隔）
+  --list-strategies        列出所有可用策略
+  
+可用策略:
+  network_aware      - 基于网络连接的BFS布局
+  compact_grid       - 紧凑网格布局
+  random_tight       - 随机紧密布局
+  clustered          - 聚类布局
+  quadratic_placement - 二次规划布局（推荐）
+  
+示例:
+  python main.py input.json --strategies quadratic_placement,network_aware,compact_grid
 """
 import json
 import sys
@@ -17,12 +31,13 @@ from typing import List, Dict, Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from route import Problem, solve
+from route import Problem, solve, SimulatedAnnealing
 
 
 def main():
     time_limit = 115.0
     input_files = []
+    strategies = None
 
     # 解析命令行参数：过滤掉 --xxx 及其值
     args = []
@@ -38,11 +53,22 @@ def main():
         idx = sys.argv.index("--time")
         if idx + 1 < len(sys.argv):
             time_limit = float(sys.argv[idx + 1])
+    
+    if "--strategies" in sys.argv:
+        idx = sys.argv.index("--strategies")
+        if idx + 1 < len(sys.argv):
+            strategies = [s.strip() for s in sys.argv[idx + 1].split(',')]
+    
+    if "--list-strategies" in sys.argv:
+        print("可用的初始化策略:")
+        for strategy in SimulatedAnnealing.get_available_strategies():
+            print(f"  - {strategy}")
+        return
 
     # 处理输入源
     if "-t" in args:
         # 内置测试用例
-        run_single_case(_builtin_test_case(), time_limit, "builtin_test")
+        run_single_case(_builtin_test_case(), time_limit, "builtin_test", strategies)
         return
     
     if "-d" in args:
@@ -63,10 +89,11 @@ def main():
 
     if not input_files:
         print("Usage:")
-        print("  python main.py input.json [--time 115]")
+        print("  python main.py input.json [--time 115] [--strategies s1,s2,s3]")
         print("  python main.py case1.json case2.json [--time 115]")
         print("  python main.py -d ./cases [--time 115]")
         print("  python main.py -t [--time 30]")
+        print("  python main.py --list-strategies")
         sys.exit(1)
 
     # 批量执行
@@ -74,7 +101,7 @@ def main():
         # 单用例模式
         with open(input_files[0], "r") as f:
             data = json.load(f)
-        run_single_case(data, time_limit, os.path.basename(input_files[0]))
+        run_single_case(data, time_limit, os.path.basename(input_files[0]), strategies)
     else:
         # 多用例模式
         print(f"=== 批量执行 {len(input_files)} 个用例 ===")
@@ -89,7 +116,7 @@ def main():
             try:
                 with open(filepath, "r") as f:
                     data = json.load(f)
-                result = run_single_case(data, time_limit, os.path.basename(filepath))
+                result = run_single_case(data, time_limit, os.path.basename(filepath), strategies)
                 results.append((os.path.basename(filepath), result))
             except Exception as e:
                 print(f"❌ 执行失败: {e}")
@@ -99,14 +126,18 @@ def main():
         print_summary(results)
 
 
-def run_single_case(data: Dict[str, Any], time_limit: float, case_name: str) -> Dict[str, Any]:
+def run_single_case(data: Dict[str, Any], time_limit: float, case_name: str, 
+                    strategies: List[str] = None) -> Dict[str, Any]:
     """执行单个用例，返回结果"""
     print(f"输入: {len(data['box_size'])} 个矩形, "
           f"{len(data.get('nets', []))} 个网络")
-    print(f"时间限制: {time_limit}s\n")
+    print(f"时间限制: {time_limit}s")
+    if strategies:
+        print(f"初始化策略: {', '.join(strategies)}")
+    print()
 
     problem = Problem(data)
-    result = solve(problem, time_limit=time_limit)
+    result = solve(problem, time_limit=time_limit, strategies=strategies)
 
     print(f"\n=== 结果 ===")
     print(f"Cost:    {result['cost']}")

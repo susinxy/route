@@ -1,8 +1,8 @@
 """
 route.py - 基于多规则的模拟电路布局算法
 
-核心思路：约束化简 + 模拟退火
-1. 将对称/对齐/重复组约束转化为线性方程组，高斯消元降维
+核心思路:约束化简 + 模拟退火
+1. 将对称/对齐/重复组约束转化为线性方程组,高斯消元降维
 2. 在独立变量的低维空间内用 SA 优化 Cost = 10*HPWL + Area
 3. 重叠惩罚引导解朝向无重叠区域
 """
@@ -91,12 +91,12 @@ class LinearExpr:
 
 class ConstraintSystem:
     """
-    约束化简系统：将硬约束转化为线性等式，高斯消元降维。
+    约束化简系统:将硬约束转化为线性等式,高斯消元降维。
 
-    变量编号：
+    变量编号:
     - 0..n-1: x_i
     - n..2n-1: y_i
-    - 2n+: 辅助变量（对称轴、重复组平移等）
+    - 2n+: 辅助变量(对称轴、重复组平移等)
     """
 
     def __init__(self, problem: Problem):
@@ -318,7 +318,7 @@ def compute_cost(problem: Problem, x: List[float], y: List[float],
 
 def validate_layout(problem: Problem, x: List[float], y: List[float],
                     eps: float = 1e-3) -> List[str]:
-    """验证布局，返回违反约束列表"""
+    """验证布局,返回违反约束列表"""
     violations = []
     n = problem.n
 
@@ -465,12 +465,16 @@ class SimulatedAnnealing:
         result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
         return result
 
+    # ========================================================================
+    # Initialization Strategies
+    # ========================================================================
+
     def _initial_network_aware(self, seed_offset=0) -> np.ndarray:
         """Network-aware initialization: cluster boxes by net connectivity"""
         n = self.problem.n
         w, h = self.problem.widths, self.problem.heights
         random.seed(self.seed + seed_offset)
-        
+
         # Build net connectivity graph
         net_neighbors = {i: set() for i in range(n)}
         for net in self.problem.nets:
@@ -479,7 +483,7 @@ class SimulatedAnnealing:
                 for j in range(i + 1, len(boxes)):
                     net_neighbors[boxes[i]].add(boxes[j])
                     net_neighbors[boxes[j]].add(boxes[i])
-        
+
         # BFS order from most connected box
         order = sorted(range(n), key=lambda i: -len(net_neighbors[i]))
         visited = set()
@@ -499,10 +503,10 @@ class SimulatedAnnealing:
         for i in range(n):
             if i not in visited:
                 bfs_order.append(i)
-        
+
         total_area = sum(w[i] * h[i] for i in range(n))
         side = math.sqrt(total_area) * 1.05
-        
+
         target_x = [0.0] * n
         target_y = [0.0] * n
         xc, yc, rh, gap = 0.0, 0.0, 0.0, 0.1
@@ -516,8 +520,9 @@ class SimulatedAnnealing:
             rh = max(rh, h[i])
 
         return self._fit_to_target(target_x, target_y)
-    
+
     def _initial_compact_grid(self, seed_offset=0) -> np.ndarray:
+        """Compact grid initialization: tight row-based placement"""
         n = self.problem.n
         w, h = self.problem.widths, self.problem.heights
         total_area = sum(w[i] * h[i] for i in range(n))
@@ -540,6 +545,7 @@ class SimulatedAnnealing:
         return self._fit_to_target(target_x, target_y)
 
     def _initial_random_tight(self, seed_offset=0) -> np.ndarray:
+        """Random tight initialization: random order with tight packing"""
         n = self.problem.n
         w, h = self.problem.widths, self.problem.heights
         random.seed(self.seed + seed_offset + 200)
@@ -564,6 +570,7 @@ class SimulatedAnnealing:
         return self._fit_to_target(target_x, target_y)
 
     def _initial_clustered(self, seed_offset=0) -> np.ndarray:
+        """Clustered initialization: group by net connectivity"""
         n = self.problem.n
         w, h = self.problem.widths, self.problem.heights
         net_boxes = set()
@@ -588,15 +595,103 @@ class SimulatedAnnealing:
 
         return self._fit_to_target(target_x, target_y)
 
+    def _initial_quadratic_placement(self, seed_offset=0) -> np.ndarray:
+        """
+        Quadratic placement initialization: minimize wirelength using quadratic programming
+
+        Solves: min Σ_net Σ_{i,j in net} [(xi-xj)2 + (yi-yj)2]
+        This naturally clusters connected components and provides a good initial layout.
+        """
+        n = self.problem.n
+        w, h = self.problem.widths, self.problem.heights
+        random.seed(self.seed + seed_offset)
+
+        # Build connectivity matrix C[i][j] = number of nets connecting i and j
+        C = np.zeros((n, n))
+        for net in self.problem.nets:
+            boxes = [b - 1 for b in net]
+            for i in range(len(boxes)):
+                for j in range(i + 1, len(boxes)):
+                    C[boxes[i], boxes[j]] += 1
+                    C[boxes[j], boxes[i]] += 1
+
+        # Build Laplacian matrix L = D - C
+        # D is degree matrix (diagonal)
+        D = np.diag(C.sum(axis=1))
+        L = D - C
+
+        # Add anchor constraints to avoid trivial solution
+        # Anchor the first box at origin and spread others
+        L[0, 0] += 1000  # Strong anchor for box 0
+
+        # Solve Lx = 0 and Ly = 0
+        # Use eigenvalue decomposition for stability
+        eigenvalues, eigenvectors = np.linalg.eigh(L)
+
+        # Skip the smallest eigenvalue (near 0, corresponds to trivial solution)
+        # Use the next 2 eigenvectors for x and y coordinates
+        if len(eigenvalues) > 2:
+            x_raw = eigenvectors[:, 1]  # Second smallest eigenvector
+            y_raw = eigenvectors[:, 2]  # Third smallest eigenvector
+        else:
+            # Fallback if not enough eigenvectors
+            x_raw = np.random.randn(n)
+            y_raw = np.random.randn(n)
+
+        # Scale to reasonable size
+        total_area = sum(w[i] * h[i] for i in range(n))
+        target_side = math.sqrt(total_area) * 1.1
+
+        x_range = x_raw.max() - x_raw.min()
+        y_range = y_raw.max() - y_raw.min()
+
+        if x_range > 0:
+            x_raw = (x_raw - x_raw.min()) / x_range * target_side
+        if y_range > 0:
+            y_raw = (y_raw - y_raw.min()) / y_range * target_side
+
+        # Legalize: remove overlaps using simple greedy approach
+        target_x, target_y = self._legalize_placement(x_raw, y_raw, w, h)
+
+        return self._fit_to_target(target_x, target_y)
+
+    def _legalize_placement(self, x_raw, y_raw, w, h):
+        """
+        Legalize placement: remove overlaps using greedy row-based packing
+        Sort by x-coordinate, then pack into rows
+        """
+        n = len(x_raw)
+
+        # Sort boxes by x-coordinate
+        order = sorted(range(n), key=lambda i: x_raw[i])
+
+        # Pack into rows
+        total_area = sum(w[i] * h[i] for i in range(n))
+        side = math.sqrt(total_area) * 1.1
+
+        target_x = [0.0] * n
+        target_y = [0.0] * n
+        xc, yc, rh, gap = 0.0, 0.0, 0.0, 0.5
+
+        for i in order:
+            if xc + w[i] > side and xc > 0:
+                xc, yc = 0.0, yc + rh + gap
+                rh = 0.0
+            target_x[i], target_y[i] = xc, yc
+            xc += w[i] + gap
+            rh = max(rh, h[i])
+
+        return target_x, target_y
+
     def _perturb(self, var_array: np.ndarray, temperature: float,
                  max_temp: float, layout_scale: float) -> np.ndarray:
         new_vars = var_array.copy()
         ratio = temperature / max_temp
-        
+
         # Use median box size as perturbation unit
         all_dims = self.problem.widths + self.problem.heights
         box_scale = sorted(all_dims)[len(all_dims) // 2]
-        
+
         r = random.random()
         if r < 0.08 and self.best_overlap < 0.01:
             # Compression move: scale all vars toward center of mass
@@ -607,26 +702,26 @@ class SimulatedAnnealing:
             # Smart move: move a box toward center of its connected neighbors
             x, y = self._decode_fast(new_vars)
             box_id = random.randint(0, self.problem.n - 1)
-            
+
             connected = set()
             for net in self.problem.nets:
                 if (box_id + 1) in net:
                     connected.update(b - 1 for b in net)
             connected.discard(box_id)
-            
+
             if connected:
                 cx = sum(x[b] + self.problem.widths[b]/2 for b in connected) / len(connected)
                 cy = sum(y[b] + self.problem.heights[b]/2 for b in connected) / len(connected)
-                
+
                 target_x = cx - self.problem.widths[box_id]/2
                 target_y = cy - self.problem.heights[box_id]/2
-                
+
                 blend = random.uniform(0.1, 0.5)
                 target_x_arr = list(x)
                 target_y_arr = list(y)
                 target_x_arr[box_id] = x[box_id] * (1 - blend) + target_x * blend
                 target_y_arr[box_id] = y[box_id] * (1 - blend) + target_y * blend
-                
+
                 new_vars = self._fit_to_target(target_x_arr, target_y_arr)
             else:
                 self._standard_perturb(new_vars, ratio, box_scale)
@@ -634,12 +729,12 @@ class SimulatedAnnealing:
             # Swap move: swap positions of two boxes
             x, y = self._decode_fast(new_vars)
             i, j = random.sample(range(self.problem.n), 2)
-            
+
             target_x = list(x)
             target_y = list(y)
             target_x[i], target_x[j] = x[j], x[i]
             target_y[i], target_y[j] = y[j], y[i]
-            
+
             new_vars = self._fit_to_target(target_x, target_y)
         else:
             self._standard_perturb(new_vars, ratio, box_scale)
@@ -665,45 +760,102 @@ class SimulatedAnnealing:
         y_range = max(y[i] + h[i] for i in range(len(y))) - min(y)
         return max(x_range, y_range, 1.0)
 
-    def run(self) -> Tuple[List[float], List[float], float]:
+    # ========================================================================
+    # Strategy Registry
+    # ========================================================================
+
+    @classmethod
+    def get_available_strategies(cls) -> List[str]:
+        """Get list of available initialization strategies"""
+        return [
+            'network_aware',
+            'compact_grid',
+            'random_tight',
+            'clustered',
+            'quadratic_placement'
+        ]
+
+    def _get_strategy_function(self, strategy_name: str, seed_offset: int = 0):
+        """Get strategy function by name"""
+        strategy_map = {
+            'network_aware': self._initial_network_aware,
+            'compact_grid': self._initial_compact_grid,
+            'random_tight': self._initial_random_tight,
+            'clustered': self._initial_clustered,
+            'quadratic_placement': self._initial_quadratic_placement,
+        }
+
+        if strategy_name not in strategy_map:
+            raise ValueError(f"Unknown strategy: {strategy_name}. "
+                           f"Available: {self.get_available_strategies()}")
+
+        return lambda: strategy_map[strategy_name](seed_offset)
+
+    def run(self, strategies: List[str] = None) -> Tuple[List[float], List[float], float]:
+        """
+        Run the simulated annealing optimization
+
+        Args:
+            strategies: List of strategy names to use. If None, uses default sequence.
+                       Available strategies: network_aware, compact_grid, random_tight,
+                                           clustered, quadratic_placement
+        """
         random.seed(self.seed)
         np.random.seed(self.seed)
         t0 = time.time()
         self._global_t0 = t0
 
-        init_strategies = [
-            lambda: self._initial_network_aware(0),
-            lambda: self._initial_compact_grid(0),
-            lambda: self._initial_clustered(0),
-            lambda: self._initial_network_aware(10),
-            lambda: self._initial_random_tight(0),
-            lambda: self._initial_clustered(10),
-        ]
+        # Default strategy sequence if not specified
+        if strategies is None:
+            strategies = [
+                'quadratic_placement',
+                'network_aware',
+                'compact_grid',
+                'clustered',
+                'quadratic_placement',
+                'random_tight',
+            ]
+
+        # Build strategy functions
+        init_strategies = []
+        for i, strategy_name in enumerate(strategies):
+            seed_offset = i * 10  # Different seed for each strategy
+            init_strategies.append(self._get_strategy_function(strategy_name, seed_offset))
 
         round_num = 0
-        while (time.time() - t0) < self.time_limit:
-            remaining = self.time_limit - (time.time() - t0)
+        best_initial_arr = None
+        exploration_time = min(30, self.time_limit * 0.25)  # 前 25% 时间用于探索
+
+        # 阶段1:快速探索,找到最好的初始解
+        print(f"  [阶段1] 探索多种初始策略 ({exploration_time:.0f}s)...")
+        while (time.time() - t0) < exploration_time and round_num < len(init_strategies):
+            remaining = exploration_time - (time.time() - t0)
             if remaining < 3:
                 break
 
-            if round_num < len(init_strategies):
-                strategy = init_strategies[round_num]
-            else:
-                # From best, apply large perturbation to escape local optima
-                def restart_from_best():
-                    arr = np.array([self.best_values[fv] for fv in self.free_vars])
-                    scale = self._compute_layout_scale(self.best_x, self.best_y) * 0.3
-                    arr += np.random.normal(0, scale, self.num_vars)
-                    return arr
-                strategy = restart_from_best
-
-            round_time = min(remaining, random.uniform(15, 25))
+            strategy = init_strategies[round_num]
+            round_time = min(remaining, 8)  # 每轮只用 8s 快速评估
             self._run_round(strategy, round_time, round_num)
-            round_num += 1
 
+            # 记录最好的初始解对应的变量值
+            if best_initial_arr is None or self.best_cost < float('inf'):
+                best_initial_arr = np.array([self.best_values[fv] for fv in self.free_vars])
+
+            round_num += 1
             elapsed = time.time() - t0
-            print(f"  [轮 {round_num}] cost={self.best_cost:.2f}, "
-                  f"overlap={self.best_overlap:.2f}, time={elapsed:.1f}s")
+            print(f"    [轮 {round_num}] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
+
+        # 阶段2:深度优化最好的解
+        print(f"  [阶段2] 深度优化最佳初始解...")
+        if best_initial_arr is not None:
+            remaining = self.time_limit - (time.time() - t0)
+            if remaining > 5:
+                def use_best_initial():
+                    return best_initial_arr.copy()
+                self._run_round(use_best_initial, remaining, round_num)
+                round_num += 1
+                elapsed = time.time() - t0
+                print(f"    [深度优化] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
 
         elapsed = time.time() - t0
         print(f"\nSA 完成: {round_num} 轮, iter={self.iterations}, "
@@ -807,13 +959,101 @@ class SimulatedAnnealing:
 # 求解入口
 # ============================================================
 
-def solve(problem: Problem, time_limit: float = 115.0) -> Dict[str, Any]:
+def _compress_layout(problem: Problem, cs: ConstraintSystem,
+                     x_coords: List[float], y_coords: List[float],
+                     remaining_time: float = 5.0) -> Tuple[List[float], List[float]]:
+    """
+    全局压缩后处理:尝试缩小组合框面积
+    策略:分别压缩 x 和 y 方向的极值
+    """
+    import numpy as np
+    t0 = time.time()
+
+    n = problem.n
+    free_vars = sorted(cs.free_vars)
+    num_vars = len(free_vars)
+
+    # 反推当前变量值
+    A = np.zeros((2 * n, num_vars))
+    b = np.zeros(2 * n)
+
+    for i in range(n):
+        expr_x = cs.var_exprs[i]
+        for j, fv in enumerate(free_vars):
+            A[i, j] = expr_x.coeffs.get(fv, 0.0)
+        b[i] = x_coords[i] - expr_x.const
+
+        expr_y = cs.var_exprs[n + i]
+        for j, fv in enumerate(free_vars):
+            A[n + i, j] = expr_y.coeffs.get(fv, 0.0)
+        b[n + i] = y_coords[i] - expr_y.const
+
+    result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    current_values = {fv: float(result[j]) for j, fv in enumerate(free_vars)}
+
+    best_values = current_values.copy()
+    best_x = x_coords.copy()
+    best_y = y_coords.copy()
+
+    # 计算当前面积
+    min_x = min(best_x)
+    max_x = max(best_x[i] + problem.widths[i] for i in range(n))
+    min_y = min(best_y)
+    max_y = max(best_y[i] + problem.heights[i] for i in range(n))
+    best_area = (max_x - min_x) * (max_y - min_y)
+
+    # 尝试不同压缩比例
+    compression_ratios = [0.95, 0.90, 0.85, 0.80, 0.75]
+
+    for ratio in compression_ratios:
+        if time.time() - t0 > remaining_time * 0.5:
+            break
+
+        # 压缩 x 方向
+        new_values = current_values.copy()
+        center_x = (min_x + max_x) / 2
+        for i in range(n):
+            expr_x = cs.var_exprs[i]
+            current_x = best_x[i]
+            # 向中心压缩
+            target_x = center_x + (current_x - center_x) * ratio
+            # 反推变量值(简化:直接缩放)
+            for fv in free_vars:
+                coeff = expr_x.coeffs.get(fv, 0.0)
+                if abs(coeff) > 1e-6:
+                    new_values[fv] *= ratio
+                    break
+
+        new_x, new_y = cs.decode(new_values)
+
+        # 检查重叠
+        overlap = compute_overlap_penalty(problem, new_x, new_y)
+        if overlap < 1e-3:  # 无重叠
+            new_min_x = min(new_x)
+            new_max_x = max(new_x[i] + problem.widths[i] for i in range(n))
+            new_min_y = min(new_y)
+            new_max_y = max(new_y[i] + problem.heights[i] for i in range(n))
+            new_area = (new_max_x - new_min_x) * (new_max_y - new_min_y)
+
+            if new_area < best_area:
+                best_values = new_values.copy()
+                best_x = new_x.copy()
+                best_y = new_y.copy()
+                best_area = new_area
+
+    return best_x, best_y
+
+
+def solve(problem: Problem, time_limit: float = 115.0,
+          strategies: List[str] = None) -> Dict[str, Any]:
     """
     求解布局问题。
 
     Args:
         problem: 布局问题实例
-        time_limit: 时间限制（秒）
+        time_limit: 时间限制(秒)
+        strategies: 初始化策略序列,如 ['quadratic_placement', 'network_aware']
+                   如果为 None,使用默认策略序列
 
     Returns:
         dict with keys: box_position, cost, hpwl, area, overlap, violations, elapsed_seconds
@@ -826,7 +1066,7 @@ def solve(problem: Problem, time_limit: float = 115.0) -> Dict[str, Any]:
 
     # 2. 模拟退火
     sa = SimulatedAnnealing(problem, cs, time_limit=time_limit)
-    x_coords, y_coords, cost = sa.run()
+    x_coords, y_coords, cost = sa.run(strategies=strategies)
 
     # 3. 后处理去重叠
     remaining = time_limit - (time.time() - t0)
@@ -834,8 +1074,15 @@ def solve(problem: Problem, time_limit: float = 115.0) -> Dict[str, Any]:
         print("后处理: 去重叠微调...")
         x_coords, y_coords = _postprocess(problem, cs, x_coords, y_coords,
                                            remaining_time=remaining)
-
-    # 4. 验证
+    
+    # 4. 全局压缩后处理
+    remaining = time_limit - (time.time() - t0)
+    if remaining > 2.0:
+        print("后处理: 全局压缩...")
+        x_coords, y_coords = _compress_layout(problem, cs, x_coords, y_coords,
+                                              remaining_time=remaining)
+    
+    # 5. 验证
     violations = validate_layout(problem, x_coords, y_coords)
     elapsed = time.time() - t0
 
@@ -864,7 +1111,7 @@ def solve(problem: Problem, time_limit: float = 115.0) -> Dict[str, Any]:
 def _postprocess(problem: Problem, cs: ConstraintSystem,
                  x_coords: List[float], y_coords: List[float],
                  remaining_time: float = 10.0) -> Tuple[List[float], List[float]]:
-    """后处理：在约束满足前提下微调消除残余重叠"""
+    """后处理:在约束满足前提下微调消除残余重叠"""
     n = problem.n
     free_vars = sorted(cs.free_vars)
     num_vars = len(free_vars)
