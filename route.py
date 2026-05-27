@@ -465,17 +465,69 @@ class SimulatedAnnealing:
         result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
         return result
 
+    def _initial_network_aware(self, seed_offset=0) -> np.ndarray:
+        """Network-aware initialization: cluster boxes by net connectivity"""
+        n = self.problem.n
+        w, h = self.problem.widths, self.problem.heights
+        random.seed(self.seed + seed_offset)
+        
+        # Build net connectivity graph
+        net_neighbors = {i: set() for i in range(n)}
+        for net in self.problem.nets:
+            boxes = [b - 1 for b in net]
+            for i in range(len(boxes)):
+                for j in range(i + 1, len(boxes)):
+                    net_neighbors[boxes[i]].add(boxes[j])
+                    net_neighbors[boxes[j]].add(boxes[i])
+        
+        # BFS order from most connected box
+        order = sorted(range(n), key=lambda i: -len(net_neighbors[i]))
+        visited = set()
+        bfs_order = []
+        for start in order:
+            if start in visited:
+                continue
+            queue = [start]
+            visited.add(start)
+            while queue:
+                node = queue.pop(0)
+                bfs_order.append(node)
+                for nb in sorted(net_neighbors[node], key=lambda x: -len(net_neighbors[x])):
+                    if nb not in visited:
+                        visited.add(nb)
+                        queue.append(nb)
+        for i in range(n):
+            if i not in visited:
+                bfs_order.append(i)
+        
+        total_area = sum(w[i] * h[i] for i in range(n))
+        side = math.sqrt(total_area) * 1.05
+        
+        target_x = [0.0] * n
+        target_y = [0.0] * n
+        xc, yc, rh, gap = 0.0, 0.0, 0.0, 0.1
+
+        for i in bfs_order:
+            if xc + w[i] > side and xc > 0:
+                xc, yc = 0.0, yc + rh + gap
+                rh = 0.0
+            target_x[i], target_y[i] = xc, yc
+            xc += w[i] + gap
+            rh = max(rh, h[i])
+
+        return self._fit_to_target(target_x, target_y)
+    
     def _initial_compact_grid(self, seed_offset=0) -> np.ndarray:
         n = self.problem.n
         w, h = self.problem.widths, self.problem.heights
         total_area = sum(w[i] * h[i] for i in range(n))
-        side = math.sqrt(total_area) * 1.1
+        side = math.sqrt(total_area) * 1.05
         order = sorted(range(n), key=lambda i: h[i], reverse=True)
         random.seed(self.seed + seed_offset)
 
         target_x = [0.0] * n
         target_y = [0.0] * n
-        xc, yc, rh, gap = 0.0, 0.0, 0.0, 0.5
+        xc, yc, rh, gap = 0.0, 0.0, 0.0, 0.2
 
         for i in order:
             if xc + w[i] > side and xc > 0:
@@ -540,17 +592,70 @@ class SimulatedAnnealing:
                  max_temp: float, layout_scale: float) -> np.ndarray:
         new_vars = var_array.copy()
         ratio = temperature / max_temp
+        
+        # Use median box size as perturbation unit
+        all_dims = self.problem.widths + self.problem.heights
+        box_scale = sorted(all_dims)[len(all_dims) // 2]
+        
+        r = random.random()
+        if r < 0.08 and self.best_overlap < 0.01:
+            # Compression move: scale all vars toward center of mass
+            factor = 1.0 - random.uniform(0.003, 0.02)
+            center = np.mean(new_vars)
+            new_vars = center + (new_vars - center) * factor
+        elif r < 0.20:
+            # Smart move: move a box toward center of its connected neighbors
+            x, y = self._decode_fast(new_vars)
+            box_id = random.randint(0, self.problem.n - 1)
+            
+            connected = set()
+            for net in self.problem.nets:
+                if (box_id + 1) in net:
+                    connected.update(b - 1 for b in net)
+            connected.discard(box_id)
+            
+            if connected:
+                cx = sum(x[b] + self.problem.widths[b]/2 for b in connected) / len(connected)
+                cy = sum(y[b] + self.problem.heights[b]/2 for b in connected) / len(connected)
+                
+                target_x = cx - self.problem.widths[box_id]/2
+                target_y = cy - self.problem.heights[box_id]/2
+                
+                blend = random.uniform(0.1, 0.5)
+                target_x_arr = list(x)
+                target_y_arr = list(y)
+                target_x_arr[box_id] = x[box_id] * (1 - blend) + target_x * blend
+                target_y_arr[box_id] = y[box_id] * (1 - blend) + target_y * blend
+                
+                new_vars = self._fit_to_target(target_x_arr, target_y_arr)
+            else:
+                self._standard_perturb(new_vars, ratio, box_scale)
+        elif r < 0.30:
+            # Swap move: swap positions of two boxes
+            x, y = self._decode_fast(new_vars)
+            i, j = random.sample(range(self.problem.n), 2)
+            
+            target_x = list(x)
+            target_y = list(y)
+            target_x[i], target_x[j] = x[j], x[i]
+            target_y[i], target_y[j] = y[j], y[i]
+            
+            new_vars = self._fit_to_target(target_x, target_y)
+        else:
+            self._standard_perturb(new_vars, ratio, box_scale)
+
+        return new_vars
+
+    def _standard_perturb(self, new_vars, ratio, box_scale):
         num_perturb = max(1, int(self.num_vars * 0.3 * (ratio ** 0.3) + 1))
         num_perturb = min(num_perturb, self.num_vars)
         selected = random.sample(range(self.num_vars), num_perturb)
-        scale = layout_scale * 0.5 * max(ratio, 0.01)
+        scale = box_scale * 2.0 * max(ratio, 0.01)
 
         for idx in selected:
             delta = scale * random.gauss(0, 1) / max(abs(random.gauss(0, 1)), 0.1)
-            delta = max(min(delta, scale * 3), -scale * 3)
+            delta = max(min(delta, scale * 5), -scale * 5)
             new_vars[idx] += delta
-
-        return new_vars
 
     def _compute_layout_scale(self, x: List[float], y: List[float]) -> float:
         if not x:
@@ -567,11 +672,11 @@ class SimulatedAnnealing:
         self._global_t0 = t0
 
         init_strategies = [
+            lambda: self._initial_network_aware(0),
             lambda: self._initial_compact_grid(0),
             lambda: self._initial_clustered(0),
+            lambda: self._initial_network_aware(10),
             lambda: self._initial_random_tight(0),
-            lambda: self._initial_compact_grid(10),
-            lambda: self._initial_random_tight(10),
             lambda: self._initial_clustered(10),
         ]
 
@@ -584,9 +689,10 @@ class SimulatedAnnealing:
             if round_num < len(init_strategies):
                 strategy = init_strategies[round_num]
             else:
+                # From best, apply large perturbation to escape local optima
                 def restart_from_best():
                     arr = np.array([self.best_values[fv] for fv in self.free_vars])
-                    scale = self._compute_layout_scale(self.best_x, self.best_y) * 0.1
+                    scale = self._compute_layout_scale(self.best_x, self.best_y) * 0.3
                     arr += np.random.normal(0, scale, self.num_vars)
                     return arr
                 strategy = restart_from_best
