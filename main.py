@@ -150,12 +150,28 @@ def validate_layout(problem: Problem, x: List[float], y: List[float],
         if max(vals) - min(vals) > eps:
             violations.append(f"对齐bottom: boxes {group}")
 
-    # 重复组
+    # 重复组：检查尺寸一致性和位置偏移一致性
     for rg in problem.repeat_groups:
         groups = [[b - 1 for b in grp] for grp in rg]
         if len(groups) < 2:
             continue
         ref = groups[0]
+        
+        # 检查对应位置的 box 尺寸是否相同
+        for ig in range(1, len(groups)):
+            grp = groups[ig]
+            for j, (ref_box, box) in enumerate(zip(ref, grp)):
+                ref_w = problem.widths[ref_box]
+                ref_h = problem.heights[ref_box]
+                box_w = problem.widths[box]
+                box_h = problem.heights[box]
+                if abs(ref_w - box_w) > eps or abs(ref_h - box_h) > eps:
+                    violations.append(
+                        f"重复组尺寸矛盾: box {ref_box+1} [{ref_w}x{ref_h}] "
+                        f"与 box {box+1} [{box_w}x{box_h}] 尺寸不同"
+                    )
+        
+        # 检查位置偏移一致性
         ref_offsets = [(x[b] - x[ref[0]], y[b] - y[ref[0]]) for b in ref]
         for ig in range(1, len(groups)):
             grp = groups[ig]
@@ -164,7 +180,7 @@ def validate_layout(problem: Problem, x: List[float], y: List[float],
                 dx_ref, dy_ref = ref_offsets[j]
                 dx_grp, dy_grp = grp_offsets[j]
                 if abs(dx_ref - dx_grp) > eps or abs(dy_ref - dy_grp) > eps:
-                    violations.append(f"重复组: box {grp[j]+1}")
+                    violations.append(f"重复组位置偏移不一致: box {grp[j]+1}")
 
     return violations
 
@@ -312,8 +328,25 @@ def verify_all_constraints(data: Dict[str, Any], positions: List[List[float]],
         if len(groups) < 2:
             continue
         ref = groups[0]
-        ref_offsets = [(x[b] - x[ref[0]], y[b] - y[ref[0]]) for b in ref]
         rg_ok = True
+        
+        # 4a. 检查对应位置的 box 尺寸是否相同
+        for ig in range(1, len(groups)):
+            grp = groups[ig]
+            for j, (ref_box, box) in enumerate(zip(ref, grp)):
+                ref_w = widths[ref_box]
+                ref_h = heights[ref_box]
+                box_w = widths[box]
+                box_h = heights[box]
+                if abs(ref_w - box_w) > eps or abs(ref_h - box_h) > eps:
+                    v = (f"  重复组{rgi}尺寸矛盾: box {ref_box+1} [{ref_w}x{ref_h}] "
+                         f"与 box {box+1} [{box_w}x{box_h}] 尺寸不同")
+                    violations.append(v)
+                    details["repeat"].append(v)
+                    rg_ok = False
+        
+        # 4b. 检查位置偏移一致性
+        ref_offsets = [(x[b] - x[ref[0]], y[b] - y[ref[0]]) for b in ref]
         for ig in range(1, len(groups)):
             grp = groups[ig]
             grp_offsets = [(x[b] - x[grp[0]], y[b] - y[grp[0]]) for b in grp]
@@ -513,7 +546,14 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
         return result
 
     # --- 2. 运行算法 ---
-    problem = Problem(input_data)
+    try:
+        problem = Problem(input_data)
+    except ValueError as e:
+        # 无解用例（如重复组尺寸矛盾）
+        result["unsolvable"] = True
+        result["unsolvable_reason"] = str(e)
+        return result
+
     solve_result = solve_and_report(problem, time_limit=time_limit)
     elapsed = solve_result["elapsed_seconds"]
 
@@ -606,16 +646,25 @@ def run_cases_parallel(filepaths: List[str], time_limit: float = 115.0,
 
                 # 进度报告
                 name = case_names[idx]
-                status = "✅" if result.get("algo_valid", result.get("expected_valid")) else "❌"
-                if "error" in result:
+                if result.get("unsolvable"):
+                    status = "⚠️无解"
+                    elapsed = 0
+                    cost = ""
+                    ratio = ""
+                elif "error" in result:
                     status = "💥"
-                elapsed = result.get("elapsed", 0)
-                cost = ""
-                if result.get("algo_cost") and "cost" in result["algo_cost"]:
-                    cost = f", cost={result['algo_cost']['cost']:.0f}"
-                ratio = ""
-                if result.get("cost_ratio"):
-                    ratio = f", ratio={result['cost_ratio']:.3f}"
+                    elapsed = 0
+                    cost = ""
+                    ratio = ""
+                else:
+                    status = "✅" if result.get("algo_valid", result.get("expected_valid")) else "❌"
+                    elapsed = result.get("elapsed", 0)
+                    cost = ""
+                    if result.get("algo_cost") and "cost" in result["algo_cost"]:
+                        cost = f", cost={result['algo_cost']['cost']:.0f}"
+                    ratio = ""
+                    if result.get("cost_ratio"):
+                        ratio = f", ratio={result['cost_ratio']:.3f}"
 
                 wall = time.time() - t0
                 print(f"  [{completed}/{total}] {status} {name} "
@@ -650,6 +699,12 @@ def print_case_result(r: Dict[str, Any], verbose: bool = False):
     print(f"📦 {case} | {desc}")
     print(f"   矩形数: {n}")
     print(f"{'─'*70}")
+
+    # Unsolvable
+    if r.get("unsolvable"):
+        print(f"   ⚠️  无解用例")
+        print(f"   原因: {r.get('unsolvable_reason', '未知')}")
+        return
 
     # Expected
     ev = r.get("expected_valid")
@@ -709,11 +764,14 @@ def print_summary(results: List[Dict[str, Any]]):
         print(f"\n   {'用例':<45} {'预期':>6} {'算法':>6} {'比值':>8} {'耗时':>8}")
         print(f"   {'─'*45} {'─'*6} {'─'*6} {'─'*8} {'─'*8}")
         for r in results:
-            e = "✅" if r.get("expected_valid") else ("❌" if r.get("expected_valid") is False else "–")
-            a = "✅" if r.get("algo_valid") else ("❌" if r.get("algo_valid") is False else "–")
-            ratio = f"{r['cost_ratio']:.3f}" if "cost_ratio" in r else "–"
-            elapsed = f"{r.get('elapsed', 0):.1f}s" if "elapsed" in r else "–"
-            print(f"   {r['case']:<45} {e:>6} {a:>6} {ratio:>8} {elapsed:>8}")
+            if r.get("unsolvable"):
+                print(f"   {r['case']:<45} {'⚠️无解':>6} {'⚠️无解':>6} {'–':>8} {'–':>8}")
+            else:
+                e = "✅" if r.get("expected_valid") else ("❌" if r.get("expected_valid") is False else "–")
+                a = "✅" if r.get("algo_valid") else ("❌" if r.get("algo_valid") is False else "–")
+                ratio = f"{r['cost_ratio']:.3f}" if "cost_ratio" in r else "–"
+                elapsed = f"{r.get('elapsed', 0):.1f}s" if "elapsed" in r else "–"
+                print(f"   {r['case']:<45} {e:>6} {a:>6} {ratio:>8} {elapsed:>8}")
 
     print(f"{'='*70}")
 
