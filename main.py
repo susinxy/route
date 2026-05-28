@@ -725,6 +725,38 @@ def visualize_case(data: Dict[str, Any], algo_result: Dict[str, Any] = None,
         plt.close(fig)
         print(f"📊 可视化已保存: {out_path}")
 
+
+def viz_from_files(input_file: str, output_file: str = None,
+                   viz_dir: str = 'visualizations') -> None:
+    """
+    从输入文件和可选的算法输出文件生成可视化图。
+
+    Args:
+        input_file: 输入用例 JSON 文件路径
+        output_file: 算法输出 JSON 文件路径 (可选)
+        viz_dir: 可视化输出目录
+    """
+    case_name = os.path.basename(input_file).replace(".json", "")
+
+    with open(input_file, 'r') as f:
+        data = json.load(f)
+
+    algo_result = None
+    if output_file and os.path.exists(output_file):
+        with open(output_file, 'r') as f:
+            algo_result = json.load(f)
+        print(f"📂 输入: {input_file}")
+        print(f"📂 输出: {output_file}")
+    else:
+        print(f"📂 输入: {input_file}")
+        if output_file:
+            print(f"⚠️  输出文件不存在: {output_file}")
+
+    viz_path = os.path.join(viz_dir, f"{case_name}.png")
+    visualize_case(data, algo_result=algo_result,
+                   case_name=case_name, save_path=viz_path)
+
+
 def solve_and_report(problem: Problem, time_limit: float = 115.0,
                      strategies: List[str] = None) -> Dict[str, Any]:
     """
@@ -1140,6 +1172,8 @@ def verify_all_constraints(data: Dict[str, Any], positions: List[List[float]],
 
 TEST_CASES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_cases")
 
+OUTPUTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+
 
 def discover_cases(filter_name: str = None) -> List[str]:
     """发现所有测试用例文件，返回排序后的路径列表"""
@@ -1327,7 +1361,13 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
         algo_c = result["algo_cost"].get("cost", float("inf"))
         result["cost_ratio"] = algo_c / exp_c if exp_c > 0 else float("inf")
 
-    # --- 5. 可视化 ---
+    # --- 5. 保存算法输出到 outputs/ ---
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    algo_output_path = os.path.join(OUTPUTS_DIR, f"{case_name}.json")
+    with open(algo_output_path, 'w') as f:
+        json.dump(solve_result, f, indent=2, ensure_ascii=False)
+
+    # --- 6. 可视化 ---
     if visualize:
         viz_path = os.path.join(viz_dir, f"{case_name}.png")
         visualize_case(data, algo_result=solve_result,
@@ -1649,8 +1689,9 @@ def _parse_arguments() -> Dict[str, Any]:
         'validate': False,
         'expected_only': False,
         'verbose': False,
-        'visualize': False,
+        'visualize': True,
         'viz_dir': 'visualizations',
+        'viz_from': None,
         'list_cases': False,
         'directory': None,
         'parallel': False,
@@ -1681,8 +1722,14 @@ def _parse_arguments() -> Dict[str, Any]:
         elif arg == "--visualize" or arg == "-V":
             config['visualize'] = True
             i += 1
+        elif arg == "--no-visualize":
+            config['visualize'] = False
+            i += 1
         elif arg == "--viz-dir" and i + 1 < len(sys.argv):
             config['viz_dir'] = sys.argv[i + 1]
+            i += 2
+        elif arg == "--viz" and i + 1 < len(sys.argv):
+            config['viz_from'] = sys.argv[i + 1]
             i += 2
         elif arg == "--parallel" or arg == "-j":
             config['parallel'] = True
@@ -1827,6 +1874,16 @@ def _run_batch_cases(input_files: List[str], config: Dict[str, Any]):
 
 def main():
     config = _parse_arguments()
+    
+    # --viz: 从文件生成可视化
+    if config['viz_from']:
+        input_file = config['viz_from']
+        case_name = os.path.basename(input_file).replace(".json", "")
+        output_file = os.path.join(OUTPUTS_DIR, f"{case_name}.json")
+        if not os.path.exists(output_file):
+            output_file = None
+        viz_from_files(input_file, output_file, config['viz_dir'])
+        return
     
     # List test cases
     if config['list_cases']:
