@@ -904,14 +904,14 @@ def main():
             print(f"错误: 目录 {directory} 中没有找到 JSON 文件")
             sys.exit(1)
 
-        # 过滤
+        # 过滤（支持多个名称）
         positional = [a for a in args if not a.startswith("-")]
         if positional:
-            filter_name = positional[0]
-            cases = [f for f in cases if filter_name in os.path.basename(f)]
+            cases = [f for f in cases
+                     if any(name in os.path.basename(f) for name in positional)]
 
         if not cases:
-            print(f"未找到匹配的用例 (filter={filter_name})")
+            print(f"未找到匹配的用例 (filter={positional})")
             sys.exit(1)
 
         if use_test_mode:
