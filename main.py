@@ -35,7 +35,6 @@ import sys
 import os
 import glob
 import time
-import hashlib
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
@@ -1142,46 +1141,6 @@ def verify_all_constraints(data: Dict[str, Any], positions: List[List[float]],
 TEST_CASES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_cases")
 
 
-# ============================================================
-# 算法结果缓存
-# ============================================================
-
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
-
-
-def _cache_key(input_data: Dict[str, Any], time_limit: float) -> str:
-    """根据输入数据和时间限制生成缓存键"""
-    # 稳定序列化（sort_keys 确保顺序一致）
-    raw = json.dumps(input_data, sort_keys=True, ensure_ascii=False)
-    h = hashlib.sha256(raw.encode()).hexdigest()[:16]
-    return f"{h}_{int(time_limit)}"
-
-
-def _cache_path(case_name: str, input_data: Dict[str, Any], time_limit: float) -> str:
-    """缓存文件路径"""
-    key = _cache_key(input_data, time_limit)
-    return os.path.join(CACHE_DIR, f"{case_name}_{key}.json")
-
-
-def _cache_load(cache_file: str) -> Optional[Dict[str, Any]]:
-    """加载缓存的算法结果，返回 None 表示未命中"""
-    if not os.path.exists(cache_file):
-        return None
-    try:
-        with open(cache_file, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return None
-
-
-def _cache_save(cache_file: str, solve_result: Dict[str, Any]):
-    """保存算法结果到缓存"""
-    os.makedirs(os.path.dirname(cache_file) or '.', exist_ok=True)
-    with open(cache_file, 'w') as f:
-        json.dump(solve_result, f, indent=2, ensure_ascii=False)
-
-
-
 def discover_cases(filter_name: str = None) -> List[str]:
     """发现所有测试用例文件，返回排序后的路径列表"""
     pattern = os.path.join(TEST_CASES_DIR, "case*.json")
@@ -1295,12 +1254,11 @@ def run_single_case(data: Dict[str, Any], time_limit: float, case_name: str,
 def run_case_test(filepath: str, time_limit: float = 115.0,
                   expected_only: bool = False,
                   visualize: bool = False,
-                  viz_dir: str = 'visualizations',
-                  no_cache: bool = False) -> Dict[str, Any]:
+                  viz_dir: str = 'visualizations') -> Dict[str, Any]:
     """
     对单个测试用例做完整验证:
       1. 验证 expected_output 约束
-      2. 运行算法（或从缓存加载），验证算法输出约束
+      2. 运行算法，验证算法输出约束
       3. 对比两者 cost
       4. 可视化（可选）
     """
@@ -1347,20 +1305,9 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
             visualize_case(data, case_name=case_name, save_path=viz_path)
         return result
 
-    # --- 3. 运行算法（支持缓存） ---
-    cache_file = _cache_path(case_name, input_data, time_limit)
-    cached = None if no_cache else _cache_load(cache_file)
-
-    if cached:
-        solve_result = cached
-        result["from_cache"] = True
-    else:
-        problem = Problem(input_data)
-        solve_result = solve_and_report(problem, time_limit=time_limit)
-        result["from_cache"] = False
-        # 保存到缓存
-        _cache_save(cache_file, solve_result)
-
+    # --- 3. 运行算法 ---
+    problem = Problem(input_data)
+    solve_result = solve_and_report(problem, time_limit=time_limit)
     elapsed = solve_result["elapsed_seconds"]
 
     algo_positions = solve_result["box_position"]
@@ -1392,8 +1339,7 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
 def _run_case_test_worker(filepath: str, time_limit: float,
                           expected_only: bool,
                           visualize: bool = False,
-                          viz_dir: str = 'visualizations',
-                          no_cache: bool = False) -> Dict[str, Any]:
+                          viz_dir: str = 'visualizations') -> Dict[str, Any]:
     """
     子进程工作函数: 静默运行单个用例测试，返回结果。
     抑制 SA 的 print 输出，避免多进程输出混乱。
@@ -1408,8 +1354,7 @@ def _run_case_test_worker(filepath: str, time_limit: float,
             result = run_case_test(filepath, time_limit=time_limit,
                                    expected_only=expected_only,
                                    visualize=visualize,
-                                   viz_dir=viz_dir,
-                                   no_cache=no_cache)
+                                   viz_dir=viz_dir)
         result["_sa_output"] = f.getvalue()
     except Exception as e:
         result = {
@@ -1423,8 +1368,7 @@ def run_cases_parallel(filepaths: List[str], time_limit: float = 115.0,
                        expected_only: bool = False,
                        visualize: bool = False,
                        viz_dir: str = 'visualizations',
-                       max_workers: int = None,
-                       no_cache: bool = False) -> List[Dict[str, Any]]:
+                       max_workers: int = None) -> List[Dict[str, Any]]:
     """
     并行运行多个测试用例。
 
@@ -1455,7 +1399,7 @@ def run_cases_parallel(filepaths: List[str], time_limit: float = 115.0,
         for idx, filepath in enumerate(filepaths):
             future = executor.submit(_run_case_test_worker, filepath,
                                      time_limit, expected_only,
-                                     visualize, viz_dir, no_cache)
+                                     visualize, viz_dir)
             future_to_idx[future] = idx
 
         completed = 0
@@ -1481,8 +1425,6 @@ def run_cases_parallel(filepaths: List[str], time_limit: float = 115.0,
                 else:
                     status = "✅" if result.get("algo_valid", result.get("expected_valid")) else "❌"
                     elapsed = result.get("elapsed", 0)
-                    cache_tag = " [缓存]" if result.get("from_cache") else ""
-                    status += cache_tag
                     cost = ""
                     if result.get("algo_cost") and "cost" in result["algo_cost"]:
                         cost = f", cost={result['algo_cost']['cost']:.0f}"
@@ -1639,8 +1581,7 @@ def print_run_summary(results: List[tuple]):
 
 def _run_test_suite(cases: List[str], time_limit: float, expected_only: bool,
                     verbose: bool, parallel: bool, max_workers: int = None,
-                    visualize: bool = False, viz_dir: str = 'visualizations',
-                    no_cache: bool = False):
+                    visualize: bool = False, viz_dir: str = 'visualizations'):
     """统一测试套件执行入口，支持串行/并行。"""
     print(f"🦐 代码虾测试运行器")
     print(f"   找到 {len(cases)} 个用例")
@@ -1660,8 +1601,7 @@ def _run_test_suite(cases: List[str], time_limit: float, expected_only: bool,
                                      expected_only=expected_only,
                                      visualize=visualize,
                                      viz_dir=viz_dir,
-                                     max_workers=max_workers,
-                                     no_cache=no_cache)
+                                     max_workers=max_workers)
         # 详细报告
         if verbose:
             for r in results:
@@ -1676,8 +1616,7 @@ def _run_test_suite(cases: List[str], time_limit: float, expected_only: bool,
                 r = run_case_test(filepath, time_limit=time_limit,
                                   expected_only=expected_only,
                                   visualize=visualize,
-                                  viz_dir=viz_dir,
-                                  no_cache=no_cache)
+                                  viz_dir=viz_dir)
                 results.append(r)
                 print_case_result(r, verbose=verbose)
             except Exception as e:
@@ -1716,7 +1655,6 @@ def _parse_arguments() -> Dict[str, Any]:
         'directory': None,
         'parallel': False,
         'max_workers': None,
-        'no_cache': False,
         'input_files': [],
         'args': []
     }
@@ -1746,9 +1684,6 @@ def _parse_arguments() -> Dict[str, Any]:
         elif arg == "--viz-dir" and i + 1 < len(sys.argv):
             config['viz_dir'] = sys.argv[i + 1]
             i += 2
-        elif arg == "--no-cache":
-            config['no_cache'] = True
-            i += 1
         elif arg == "--parallel" or arg == "-j":
             config['parallel'] = True
             if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit():
@@ -1821,8 +1756,7 @@ def _handle_directory_mode(config: Dict[str, Any]):
         # Test mode
         _run_test_suite(cases, config['time_limit'], config['expected_only'],
                         config['verbose'], config['parallel'], config['max_workers'],
-                        config['visualize'], config['viz_dir'],
-                        config['no_cache'])
+                        config['visualize'], config['viz_dir'])
     else:
         # Run mode
         return cases
