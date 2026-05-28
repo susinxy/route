@@ -1,10 +1,12 @@
 """
-route.py - 基于多规则的模拟电路布局算法
+route.py - 基于多规则的模拟电路布局算法 (纯算法模块)
 
 核心思路:约束化简 + 模拟退火
 1. 将对称/对齐/重复组约束转化为线性方程组,高斯消元降维
 2. 在独立变量的低维空间内用 SA 优化 Cost = 10*HPWL + Area
 3. 重叠惩罚引导解朝向无重叠区域
+
+本模块只包含求解算法，不包含 I/O、测试、验证功能。
 """
 import math
 import random
@@ -15,6 +17,7 @@ import numpy as np
 
 # SA 优化时每个 box 向外膨胀的边距，迫使解保持间距避免微小重叠
 OVERLAP_MARGIN = 0.02
+
 
 # ============================================================
 # 数据模型
@@ -226,68 +229,98 @@ class ConstraintSystem:
         for i, eq in enumerate(self.equations):
             for var_id, coeff in eq.coeffs.items():
                 A[i, var_id] = coeff
-            A[i, -1] = -eq.const
+            A[i, num_vars] = -eq.const
 
-        pivot_row = 0
+        # 高斯消元 (RREF)
         pivot_cols = []
-
+        row = 0
         for col in range(num_vars):
-            if pivot_row >= num_eqs:
+            if row >= num_eqs:
                 break
-            max_row = pivot_row
-            for row in range(pivot_row + 1, num_eqs):
-                if abs(A[row, col]) > abs(A[max_row, col]):
-                    max_row = row
+            max_row = row
+            for r in range(row + 1, num_eqs):
+                if abs(A[r, col]) > abs(A[max_row, col]):
+                    max_row = r
             if abs(A[max_row, col]) < 1e-10:
                 continue
-            A[[pivot_row, max_row]] = A[[max_row, pivot_row]]
-            pivot_val = A[pivot_row, col]
-            A[pivot_row] /= pivot_val
-            for row in range(num_eqs):
-                if row != pivot_row and abs(A[row, col]) > 1e-10:
-                    A[row] -= A[row, col] * A[pivot_row]
+            A[[row, max_row]] = A[[max_row, row]]
+            pivot = A[row, col]
+            A[row] /= pivot
+            for r in range(num_eqs):
+                if r != row and abs(A[r, col]) > 1e-10:
+                    A[r] -= A[r, col] * A[row]
             pivot_cols.append(col)
-            pivot_row += 1
+            row += 1
 
+        # 识别自由变量
         pivot_set = set(pivot_cols)
         self.free_vars = set(range(num_vars)) - pivot_set
 
-        self.var_exprs = [LinearExpr({}, 0.0) for _ in range(num_vars)]
-        for fv in self.free_vars:
-            self.var_exprs[fv] = LinearExpr({fv: 1.0}, 0.0)
+        # 更新 var_exprs: 主变量用自由变量表示
+        for i, pcol in enumerate(pivot_cols):
+            coeffs = {}
+            const = A[i, num_vars]
+            for j in range(num_vars):
+                if j != pcol and abs(A[i, j]) > 1e-10:
+                    coeffs[j] = -A[i, j]
+            self.var_exprs[pcol] = LinearExpr(coeffs, const)
 
-        for i, col in enumerate(pivot_cols):
-            expr = LinearExpr({}, A[i, -1])
-            for fv in self.free_vars:
-                coeff = -A[i, fv]
-                if abs(coeff) > 1e-10:
-                    expr.coeffs[fv] = coeff
-            self.var_exprs[col] = expr
+        # 递归展开: 主变量表达式中可能引用其他主变量
+        changed = True
+        max_iter = 100
+        while changed and max_iter > 0:
+            changed = False
+            max_iter -= 1
+            for var_id in range(num_vars):
+                expr = self.var_exprs[var_id]
+                new_coeffs = {}
+                new_const = expr.const
+                for k, v in expr.coeffs.items():
+                    sub = self.var_exprs[k]
+                    if len(sub.coeffs) == 1 and k in sub.coeffs and sub.coeffs[k] == 1.0 and k != var_id:
+                        # k is still a free var or identity
+                        new_coeffs[k] = new_coeffs.get(k, 0) + v
+                    elif k != var_id and not (len(sub.coeffs) == 1 and k in sub.coeffs and sub.coeffs[k] == 1.0):
+                        for sk, sv in sub.coeffs.items():
+                            new_coeffs[sk] = new_coeffs.get(sk, 0) + v * sv
+                        new_const += v * sub.const
+                        changed = True
+                    else:
+                        new_coeffs[k] = new_coeffs.get(k, 0) + v
+                if changed:
+                    self.var_exprs[var_id] = LinearExpr(new_coeffs, new_const)
 
-    def decode(self, var_values: Dict[int, float]) -> Tuple[List[float], List[float]]:
-        """从独立变量值解码出坐标"""
-        n = self.n
-        x_coords = [self.var_exprs[i].evaluate(var_values) for i in range(n)]
-        y_coords = [self.var_exprs[n + i].evaluate(var_values) for i in range(n)]
-        return x_coords, y_coords
+    def decode(self, free_values: Dict[int, float]) -> Tuple[List[float], List[float]]:
+        """给定自由变量的值,解码出所有 box 的 x, y 坐标"""
+        x = [0.0] * self.n
+        y = [0.0] * self.n
+        for i in range(self.n):
+            x[i] = self.var_exprs[i].evaluate(free_values)
+            y[i] = self.var_exprs[self.n + i].evaluate(free_values)
+        return x, y
 
 
 # ============================================================
-# 评价函数
+# 代价函数
 # ============================================================
 
 def compute_hpwl(problem: Problem, x: List[float], y: List[float]) -> float:
-    hpwl = 0.0
+    total = 0.0
     for net in problem.nets:
         if len(net) < 2:
             continue
-        cxs = [x[b - 1] + problem.widths[b - 1] / 2 for b in net]
-        cys = [y[b - 1] + problem.heights[b - 1] / 2 for b in net]
-        hpwl += (max(cxs) - min(cxs)) + (max(cys) - min(cys))
-    return hpwl
+        boxes = [b - 1 for b in net]
+        min_x = min(x[b] + problem.widths[b] / 2 for b in boxes)
+        max_x = max(x[b] + problem.widths[b] / 2 for b in boxes)
+        min_y = min(y[b] + problem.heights[b] / 2 for b in boxes)
+        max_y = max(y[b] + problem.heights[b] / 2 for b in boxes)
+        total += (max_x - min_x) + (max_y - min_y)
+    return total
 
 
 def compute_area(problem: Problem, x: List[float], y: List[float]) -> float:
+    if not x:
+        return 0.0
     min_x = min(x)
     min_y = min(y)
     max_x = max(x[i] + problem.widths[i] for i in range(problem.n))
@@ -332,105 +365,6 @@ def compute_cost(problem: Problem, x: List[float], y: List[float],
 
 
 # ============================================================
-# 验证器
-# ============================================================
-
-def validate_layout(problem: Problem, x: List[float], y: List[float],
-                    eps: float = 1e-3) -> List[str]:
-    """验证布局,返回违反约束列表"""
-    violations = []
-    n = problem.n
-
-    # 不重叠
-    for i in range(n):
-        for j in range(i + 1, n):
-            ox = min(x[i] + problem.widths[i], x[j] + problem.widths[j]) - max(x[i], x[j])
-            oy = min(y[i] + problem.heights[i], y[j] + problem.heights[j]) - max(y[i], y[j])
-            if ox > eps and oy > eps:
-                violations.append(f"重叠: box {i+1} 和 box {j+1}")
-
-    # X轴对称
-    for group in problem.sym_x_groups:
-        axis_vals = []
-        for pair in group.get("symmetry_pair", []):
-            i, j = pair[0] - 1, pair[1] - 1
-            axis_vals.append((x[i] + problem.widths[i]/2 + x[j] + problem.widths[j]/2) / 2)
-        for s in group.get("self_symmetry", []):
-            axis_vals.append(x[s-1] + problem.widths[s-1] / 2)
-        if axis_vals:
-            axis = sum(axis_vals) / len(axis_vals)
-            for pair in group.get("symmetry_pair", []):
-                i, j = pair[0] - 1, pair[1] - 1
-                mid = (x[i] + problem.widths[i]/2 + x[j] + problem.widths[j]/2) / 2
-                if abs(mid - axis) > eps:
-                    violations.append(f"对称x: box {i+1} 和 {j+1}")
-            for s in group.get("self_symmetry", []):
-                s -= 1
-                if abs(x[s] + problem.widths[s]/2 - axis) > eps:
-                    violations.append(f"自对称x: box {s+1}")
-
-    # Y轴对称
-    for group in problem.sym_y_groups:
-        axis_vals = []
-        for pair in group.get("symmetry_pair", []):
-            i, j = pair[0] - 1, pair[1] - 1
-            axis_vals.append((y[i] + problem.heights[i]/2 + y[j] + problem.heights[j]/2) / 2)
-        for s in group.get("self_symmetry", []):
-            axis_vals.append(y[s-1] + problem.heights[s-1] / 2)
-        if axis_vals:
-            axis = sum(axis_vals) / len(axis_vals)
-            for pair in group.get("symmetry_pair", []):
-                i, j = pair[0] - 1, pair[1] - 1
-                mid = (y[i] + problem.heights[i]/2 + y[j] + problem.heights[j]/2) / 2
-                if abs(mid - axis) > eps:
-                    violations.append(f"对称y: box {i+1} 和 {j+1}")
-            for s in group.get("self_symmetry", []):
-                s -= 1
-                if abs(y[s] + problem.heights[s]/2 - axis) > eps:
-                    violations.append(f"自对称y: box {s+1}")
-
-    # 对齐
-    for group in problem.align_left:
-        boxes = [b - 1 for b in group]
-        vals = [x[b] for b in boxes]
-        if max(vals) - min(vals) > eps:
-            violations.append(f"对齐left: boxes {group}")
-    for group in problem.align_right:
-        boxes = [b - 1 for b in group]
-        vals = [x[b] + problem.widths[b] for b in boxes]
-        if max(vals) - min(vals) > eps:
-            violations.append(f"对齐right: boxes {group}")
-    for group in problem.align_top:
-        boxes = [b - 1 for b in group]
-        vals = [y[b] + problem.heights[b] for b in boxes]
-        if max(vals) - min(vals) > eps:
-            violations.append(f"对齐top: boxes {group}")
-    for group in problem.align_bottom:
-        boxes = [b - 1 for b in group]
-        vals = [y[b] for b in boxes]
-        if max(vals) - min(vals) > eps:
-            violations.append(f"对齐bottom: boxes {group}")
-
-    # 重复组
-    for rg in problem.repeat_groups:
-        groups = [[b - 1 for b in grp] for grp in rg]
-        if len(groups) < 2:
-            continue
-        ref = groups[0]
-        ref_offsets = [(x[b] - x[ref[0]], y[b] - y[ref[0]]) for b in ref]
-        for ig in range(1, len(groups)):
-            grp = groups[ig]
-            grp_offsets = [(x[b] - x[grp[0]], y[b] - y[grp[0]]) for b in grp]
-            for j in range(len(ref)):
-                dx_ref, dy_ref = ref_offsets[j]
-                dx_grp, dy_grp = grp_offsets[j]
-                if abs(dx_ref - dx_grp) > eps or abs(dy_ref - dy_grp) > eps:
-                    violations.append(f"重复组: box {grp[j]+1}")
-
-    return violations
-
-
-# ============================================================
 # 模拟退火优化器
 # ============================================================
 
@@ -457,36 +391,81 @@ class SimulatedAnnealing:
         self.accepted = 0
 
     def _precompute_matrices(self):
+        """预计算 HPWL/Area 的矩阵形式以加速评估"""
         n = self.problem.n
-        self.A_x = np.zeros((n, self.num_vars))
-        self.A_y = np.zeros((n, self.num_vars))
-        self.b_x = np.zeros(n)
-        self.b_y = np.zeros(n)
+        nv = self.num_vars
+        cs = self.cs
+
+        # 构建 x_i, y_i 关于自由变量的系数矩阵
+        self.x_coeffs = np.zeros((n, nv))
+        self.x_const = np.zeros(n)
+        self.y_coeffs = np.zeros((n, nv))
+        self.y_const = np.zeros(n)
+
+        fv_idx = {fv: j for j, fv in enumerate(self.free_vars)}
 
         for i in range(n):
-            expr_x = self.cs.var_exprs[i]
-            self.b_x[i] = expr_x.const
-            for j, fv in enumerate(self.free_vars):
-                self.A_x[i, j] = expr_x.coeffs.get(fv, 0.0)
-            expr_y = self.cs.var_exprs[n + i]
-            self.b_y[i] = expr_y.const
-            for j, fv in enumerate(self.free_vars):
-                self.A_y[i, j] = expr_y.coeffs.get(fv, 0.0)
+            expr_x = cs.var_exprs[i]
+            self.x_const[i] = expr_x.const
+            for fv, c in expr_x.coeffs.items():
+                if fv in fv_idx:
+                    self.x_coeffs[i, fv_idx[fv]] = c
+
+            expr_y = cs.var_exprs[n + i]
+            self.y_const[i] = expr_y.const
+            for fv, c in expr_y.coeffs.items():
+                if fv in fv_idx:
+                    self.y_coeffs[i, fv_idx[fv]] = c
 
     def _decode_fast(self, var_array: np.ndarray) -> Tuple[List[float], List[float]]:
-        x = self.A_x @ var_array + self.b_x
-        y = self.A_y @ var_array + self.b_y
+        """快速解码: 矩阵运算"""
+        x = self.x_coeffs @ var_array + self.x_const
+        y = self.y_coeffs @ var_array + self.y_const
         return x.tolist(), y.tolist()
 
+    def _compute_layout_scale(self, x: List[float], y: List[float]) -> float:
+        """计算布局尺度，用于自适应扰动"""
+        if not x:
+            return 1.0
+        x_range = max(x) - min(x) + max(self.problem.widths)
+        y_range = max(y) - min(y) + max(self.problem.heights)
+        return max(x_range, y_range, 1.0)
+
     def _fit_to_target(self, target_x: List[float], target_y: List[float]) -> np.ndarray:
-        A = np.vstack([self.A_x, self.A_y])
-        b = np.concatenate([np.array(target_x) - self.b_x, np.array(target_y) - self.b_y])
+        """将目标坐标映射到约束空间的自由变量值"""
+        n = self.problem.n
+        nv = self.num_vars
+        cs = self.cs
+
+        # 构建目标向量
+        target = np.zeros(2 * n)
+        for i in range(n):
+            target[i] = target_x[i]
+            target[n + i] = target_y[i]
+
+        # 构建系数矩阵
+        fv_idx = {fv: j for j, fv in enumerate(self.free_vars)}
+        A = np.zeros((2 * n, nv))
+        b = np.zeros(2 * n)
+
+        for i in range(n):
+            expr_x = cs.var_exprs[i]
+            for fv, c in expr_x.coeffs.items():
+                if fv in fv_idx:
+                    A[i, fv_idx[fv]] = c
+            b[i] = target_x[i] - expr_x.const
+
+            expr_y = cs.var_exprs[n + i]
+            for fv, c in expr_y.coeffs.items():
+                if fv in fv_idx:
+                    A[n + i, fv_idx[fv]] = c
+            b[n + i] = target_y[i] - expr_y.const
+
+        # 最小二乘求解
         result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
         return result
 
-    # ========================================================================
-    # Initialization Strategies
-    # ========================================================================
+    # ---- 初始化策略 ----
 
     def _initial_network_aware(self, seed_offset=0) -> np.ndarray:
         """Network-aware initialization: cluster boxes by net connectivity"""
@@ -659,7 +638,7 @@ class SimulatedAnnealing:
 
         # Scale to reasonable size
         total_area = sum(w[i] * h[i] for i in range(n))
-        target_side = math.sqrt(total_area) * 1.1
+        target_side = math.sqrt(total_area) * 1.5
 
         x_range = x_raw.max() - x_raw.min()
         y_range = y_raw.max() - y_raw.min()
@@ -669,162 +648,15 @@ class SimulatedAnnealing:
         if y_range > 0:
             y_raw = (y_raw - y_raw.min()) / y_range * target_side
 
-        # Legalize: remove overlaps using simple greedy approach
-        target_x, target_y = self._legalize_placement(x_raw, y_raw, w, h)
+        # Add some randomness to break symmetry
+        noise_scale = target_side * 0.05
+        x_raw += np.random.randn(n) * noise_scale
+        y_raw += np.random.randn(n) * noise_scale
+
+        target_x = x_raw.tolist()
+        target_y = y_raw.tolist()
 
         return self._fit_to_target(target_x, target_y)
-
-    def _legalize_placement(self, x_raw, y_raw, w, h):
-        """
-        Legalize placement: remove overlaps using greedy row-based packing
-        Sort by x-coordinate, then pack into rows
-        """
-        n = len(x_raw)
-
-        # Sort boxes by x-coordinate
-        order = sorted(range(n), key=lambda i: x_raw[i])
-
-        # Pack into rows
-        total_area = sum(w[i] * h[i] for i in range(n))
-        side = math.sqrt(total_area) * 1.1
-
-        target_x = [0.0] * n
-        target_y = [0.0] * n
-        xc, yc, rh, gap = 0.0, 0.0, 0.0, 0.5
-
-        for i in order:
-            if xc + w[i] > side and xc > 0:
-                xc, yc = 0.0, yc + rh + gap
-                rh = 0.0
-            target_x[i], target_y[i] = xc, yc
-            xc += w[i] + gap
-            rh = max(rh, h[i])
-
-        return target_x, target_y
-
-    def _perturb(self, var_array: np.ndarray, temperature: float,
-                 max_temp: float, layout_scale: float) -> np.ndarray:
-        new_vars = var_array.copy()
-        ratio = temperature / max_temp
-
-        # Use median box size as perturbation unit
-        all_dims = self.problem.widths + self.problem.heights
-        box_scale = sorted(all_dims)[len(all_dims) // 2]
-
-        r = random.random()
-        if r < 0.15 and self.best_overlap < 0.001:
-            # Compression move: scale all vars toward center of mass
-            factor = 1.0 - random.uniform(0.005, 0.03)
-            center = np.mean(new_vars)
-            new_vars = center + (new_vars - center) * factor
-        elif r < 0.25:
-            # Area-focused move: shrink boundary boxes toward center
-            x, y = self._decode_fast(new_vars)
-            w, h = self.problem.widths, self.problem.heights
-            
-            # Find bounding box
-            min_x = min(x)
-            max_x = max(x[i] + w[i] for i in range(len(x)))
-            min_y = min(y)
-            max_y = max(y[i] + h[i] for i in range(len(y)))
-            
-            center_x = (min_x + max_x) / 2
-            center_y = (min_y + max_y) / 2
-            
-            # Identify boundary boxes (within 20% of edges)
-            margin_x = (max_x - min_x) * 0.2
-            margin_y = (max_y - min_y) * 0.2
-            
-            boundary_boxes = []
-            for i in range(len(x)):
-                box_cx = x[i] + w[i] / 2
-                box_cy = y[i] + h[i] / 2
-                if (box_cx < min_x + margin_x or box_cx > max_x - margin_x or
-                    box_cy < min_y + margin_y or box_cy > max_y - margin_y):
-                    boundary_boxes.append(i)
-            
-            if boundary_boxes:
-                # Move 1-2 boundary boxes toward center
-                num_to_move = min(random.randint(1, 2), len(boundary_boxes))
-                selected = random.sample(boundary_boxes, num_to_move)
-                
-                shrink_factor = random.uniform(0.1, 0.3)
-                target_x_arr = list(x)
-                target_y_arr = list(y)
-                
-                for box_id in selected:
-                    # Move toward center
-                    target_x_arr[box_id] = x[box_id] + (center_x - x[box_id]) * shrink_factor
-                    target_y_arr[box_id] = y[box_id] + (center_y - y[box_id]) * shrink_factor
-                
-                new_vars = self._fit_to_target(target_x_arr, target_y_arr)
-            else:
-                self._standard_perturb(new_vars, ratio, box_scale)
-        elif r < 0.35:
-            # Smart move: move a box toward center of its connected neighbors
-            x, y = self._decode_fast(new_vars)
-            box_id = random.randint(0, self.problem.n - 1)
-
-            connected = set()
-            for net in self.problem.nets:
-                if (box_id + 1) in net:
-                    connected.update(b - 1 for b in net)
-            connected.discard(box_id)
-
-            if connected:
-                cx = sum(x[b] + self.problem.widths[b]/2 for b in connected) / len(connected)
-                cy = sum(y[b] + self.problem.heights[b]/2 for b in connected) / len(connected)
-
-                target_x = cx - self.problem.widths[box_id]/2
-                target_y = cy - self.problem.heights[box_id]/2
-
-                blend = random.uniform(0.1, 0.5)
-                target_x_arr = list(x)
-                target_y_arr = list(y)
-                target_x_arr[box_id] = x[box_id] * (1 - blend) + target_x * blend
-                target_y_arr[box_id] = y[box_id] * (1 - blend) + target_y * blend
-
-                new_vars = self._fit_to_target(target_x_arr, target_y_arr)
-            else:
-                self._standard_perturb(new_vars, ratio, box_scale)
-        elif r < 0.30:
-            # Swap move: swap positions of two boxes
-            x, y = self._decode_fast(new_vars)
-            i, j = random.sample(range(self.problem.n), 2)
-
-            target_x = list(x)
-            target_y = list(y)
-            target_x[i], target_x[j] = x[j], x[i]
-            target_y[i], target_y[j] = y[j], y[i]
-
-            new_vars = self._fit_to_target(target_x, target_y)
-        else:
-            self._standard_perturb(new_vars, ratio, box_scale)
-
-        return new_vars
-
-    def _standard_perturb(self, new_vars, ratio, box_scale):
-        num_perturb = max(1, int(self.num_vars * 0.3 * (ratio ** 0.3) + 1))
-        num_perturb = min(num_perturb, self.num_vars)
-        selected = random.sample(range(self.num_vars), num_perturb)
-        scale = box_scale * 2.0 * max(ratio, 0.01)
-
-        for idx in selected:
-            delta = scale * random.gauss(0, 1) / max(abs(random.gauss(0, 1)), 0.1)
-            delta = max(min(delta, scale * 5), -scale * 5)
-            new_vars[idx] += delta
-
-    def _compute_layout_scale(self, x: List[float], y: List[float]) -> float:
-        if not x:
-            return 100.0
-        w, h = self.problem.widths, self.problem.heights
-        x_range = max(x[i] + w[i] for i in range(len(x))) - min(x)
-        y_range = max(y[i] + h[i] for i in range(len(y))) - min(y)
-        return max(x_range, y_range, 1.0)
-
-    # ========================================================================
-    # Strategy Registry
-    # ========================================================================
 
     @classmethod
     def get_available_strategies(cls) -> List[str]:
@@ -839,35 +671,33 @@ class SimulatedAnnealing:
 
     def _get_strategy_function(self, strategy_name: str, seed_offset: int = 0):
         """Get strategy function by name"""
-        strategy_map = {
+        strategies = {
             'network_aware': self._initial_network_aware,
             'compact_grid': self._initial_compact_grid,
             'random_tight': self._initial_random_tight,
             'clustered': self._initial_clustered,
             'quadratic_placement': self._initial_quadratic_placement,
         }
-
-        if strategy_name not in strategy_map:
+        if strategy_name not in strategies:
             raise ValueError(f"Unknown strategy: {strategy_name}. "
                            f"Available: {self.get_available_strategies()}")
-
-        return lambda: strategy_map[strategy_name](seed_offset)
+        return lambda: strategies[strategy_name](seed_offset)
 
     def run(self, strategies: List[str] = None) -> Tuple[List[float], List[float], float]:
         """
-        Run the simulated annealing optimization
+        Run simulated annealing optimization.
 
         Args:
             strategies: List of strategy names to use. If None, uses default sequence.
                        Available strategies: network_aware, compact_grid, random_tight,
                                            clustered, quadratic_placement
+
+        Returns:
+            (x_coords, y_coords, cost)
         """
-        random.seed(self.seed)
-        np.random.seed(self.seed)
         t0 = time.time()
         self._global_t0 = t0
 
-        # Default strategy sequence if not specified
         if strategies is None:
             strategies = [
                 'quadratic_placement',
@@ -875,49 +705,46 @@ class SimulatedAnnealing:
                 'compact_grid',
                 'clustered',
                 'quadratic_placement',
-                'random_tight',
+                'random_tight'
             ]
 
-        # Build strategy functions
+        # Build init functions
         init_strategies = []
         for i, strategy_name in enumerate(strategies):
-            seed_offset = i * 10  # Different seed for each strategy
+            # Use different seeds for different rounds
+            seed_offset = i * 1000
             init_strategies.append(self._get_strategy_function(strategy_name, seed_offset))
 
+        # Phase 1: Try multiple initial strategies
+        exploration_time = min(self.time_limit * 0.25, 15.0)
         round_num = 0
-        best_initial_arr = None
-        exploration_time = min(30, self.time_limit * 0.25)  # 前 25% 时间用于探索
 
-        # 阶段1:快速探索,找到最好的初始解
-        print(f"  [阶段1] 探索多种初始策略 ({exploration_time:.0f}s)...")
         while (time.time() - t0) < exploration_time and round_num < len(init_strategies):
-            remaining = exploration_time - (time.time() - t0)
-            if remaining < 3:
-                break
-
-            strategy = init_strategies[round_num]
-            round_time = min(remaining, 8)  # 每轮只用 8s 快速评估
-            self._run_round(strategy, round_time, round_num)
-
-            # 记录最好的初始解对应的变量值
-            if best_initial_arr is None or self.best_cost < float('inf'):
-                best_initial_arr = np.array([self.best_values[fv] for fv in self.free_vars])
-
             round_num += 1
+            strategy = init_strategies[round_num - 1]
+
+            time_budget = min(
+                (exploration_time - (time.time() - t0)) / max(1, len(init_strategies) - round_num + 1),
+                8.0
+            )
+            time_budget = max(time_budget, 2.0)
+
+            self._run_round(strategy, time_budget, round_num)
             elapsed = time.time() - t0
             print(f"    [轮 {round_num}] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
 
-        # 阶段2:深度优化最好的解(单次长轮)
-        print(f"  [阶段2] 深度优化最佳初始解...")
-        if best_initial_arr is not None:
-            remaining = self.time_limit - (time.time() - t0)
-            if remaining > 5:
-                def use_best_initial():
-                    return best_initial_arr.copy()
-                self._run_round(use_best_initial, remaining, round_num)
-                round_num += 1
-                elapsed = time.time() - t0
-                print(f"    [深度优化] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
+        # Phase 2: Deep optimization from best solution
+        remaining = self.time_limit - (time.time() - t0)
+        if remaining > 1.0 and self.best_cost < float('inf'):
+            round_num += 1
+            elapsed = time.time() - t0
+            print(f"  [阶段2] 深度优化最佳初始解...")
+            self._run_round(
+                lambda: np.array([self.best_values[fv] for fv in self.free_vars]),
+                remaining, round_num
+            )
+            elapsed = time.time() - t0
+            print(f"    [深度优化] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
 
         elapsed = time.time() - t0
         print(f"\nSA 完成: {round_num} 轮, iter={self.iterations}, "
@@ -1032,186 +859,53 @@ class SimulatedAnnealing:
             self.best_overlap = overlap
             self.best_cost = real_cost
 
+    def _perturb(self, var_array: np.ndarray, temperature: float,
+                 max_temp: float, layout_scale: float) -> np.ndarray:
+        new_vars = var_array.copy()
+        ratio = temperature / max_temp
+
+        # Use median box size as perturbation unit
+        all_dims = self.problem.widths + self.problem.heights
+        box_scale = sorted(all_dims)[len(all_dims) // 2]
+
+        r = random.random()
+        if r < 0.15 and self.best_overlap < 0.001:
+            # Compression move: scale all vars toward center of mass
+            factor = 1.0 - random.uniform(0.005, 0.03)
+            center = np.mean(new_vars)
+            new_vars = center + (new_vars - center) * factor
+        elif r < 0.25:
+            # Area-focused move: shrink boundary boxes toward center
+            if self.best_x:
+                x, y = self._decode_fast(new_vars)
+                cx = (min(x) + max(x)) / 2
+                cy = (min(y) + max(y)) / 2
+                factor = 1.0 - random.uniform(0.01, 0.05)
+                new_vars = new_vars * factor + (1 - factor) * np.mean(new_vars)
+        else:
+            # Standard perturbation
+            if ratio > 0.5:
+                scale = layout_scale * ratio * 0.3
+            elif ratio > 0.1:
+                scale = layout_scale * ratio * 0.15
+            else:
+                scale = box_scale * max(ratio, 0.01) * 2.0
+
+            # Pick 1-3 variables to perturb
+            num_perturb = min(random.randint(1, 3), self.num_vars)
+            indices = random.sample(range(self.num_vars), num_perturb)
+
+            for idx in indices:
+                delta = scale * random.gauss(0, 1) / max(abs(random.gauss(0, 1)), 0.1)
+                delta = max(min(delta, scale * 5), -scale * 5)
+                new_vars[idx] += delta
+
+        return new_vars
+
 
 # ============================================================
-# 求解入口
+# 后处理
 # ============================================================
-
-def _compress_layout(problem: Problem, cs: ConstraintSystem, 
-                     x_coords: List[float], y_coords: List[float],
-                     remaining_time: float = 5.0) -> Tuple[List[float], List[float]]:
-    """
-    全局压缩后处理：仅在能改善总成本时应用
-    
-    策略：
-    1. 小幅缩放（0.95-1.05）变量值
-    2. 只有当新cost < 原cost时才接受
-    3. 迭代尝试直到时间用尽或无改善
-    """
-    import numpy as np
-    t0 = time.time()
-    
-    n = problem.n
-    free_vars = sorted(cs.free_vars)
-    num_vars = len(free_vars)
-    
-    # 反推当前变量值
-    A = np.zeros((2 * n, num_vars))
-    b_vec = np.zeros(2 * n)
-    
-    for i in range(n):
-        expr_x = cs.var_exprs[i]
-        for j, fv in enumerate(free_vars):
-            A[i, j] = expr_x.coeffs.get(fv, 0.0)
-        b_vec[i] = x_coords[i] - expr_x.const
-        
-        expr_y = cs.var_exprs[n + i]
-        for j, fv in enumerate(free_vars):
-            A[n + i, j] = expr_y.coeffs.get(fv, 0.0)
-        b_vec[n + i] = y_coords[i] - expr_y.const
-    
-    result, _, _, _ = np.linalg.lstsq(A, b_vec, rcond=None)
-    current_arr = result.copy()
-    
-    # 计算当前cost
-    _, hpwl0, area0, overlap0 = compute_cost(problem, x_coords, y_coords)
-    best_cost = 10 * hpwl0 + area0
-    best_x = x_coords.copy()
-    best_y = y_coords.copy()
-    best_arr = current_arr.copy()
-    
-    print(f"    压缩前: cost={best_cost:.1f}, area={area0:.1f}, hpwl={hpwl0:.1f}, overlap={overlap0:.2f}")
-    
-    # 改进策略：独立缩放x和y方向，更细粒度搜索
-    improved = True
-    iteration = 0
-    
-    while improved and time.time() - t0 < remaining_time * 0.9 and iteration < 30:
-        improved = False
-        iteration += 1
-        
-        # 尝试不同缩放比例组合（x和y独立）
-        scales_x = [0.99, 0.98, 0.97, 0.96, 0.95, 1.00, 1.01, 1.02]
-        scales_y = [0.99, 0.98, 0.97, 0.96, 0.95, 1.00, 1.01, 1.02]
-        
-        best_scale_combo = None
-        best_scale_cost = best_cost
-        
-        for sx in scales_x:
-            for sy in scales_y:
-                if sx == 1.00 and sy == 1.00:
-                    continue
-                if time.time() - t0 > remaining_time * 0.85:
-                    break
-                
-                # 分别缩放x和y方向的变量
-                new_arr = current_arr.copy()
-                # 简化：统一缩放（因为变量混合了x和y）
-                scale = (sx + sy) / 2.0
-                centroid = np.mean(current_arr)
-                new_arr = centroid + (current_arr - centroid) * scale
-                
-                new_x, new_y = cs.decode(
-                    {fv: float(new_arr[j]) for j, fv in enumerate(free_vars)})
-                
-                # 检查重叠
-                overlap = compute_overlap_penalty(problem, new_x, new_y)
-                if overlap > 15.0:  # 允许少量重叠
-                    continue
-                
-                _, new_hpwl, new_area, new_overlap = compute_cost(problem, new_x, new_y)
-                new_cost = 10 * new_hpwl + new_area
-                
-                # 如果改善超过0.5%，记录下来
-                if new_cost < best_scale_cost * 0.995:
-                    best_scale_cost = new_cost
-                    best_scale_combo = (sx, sy)
-        
-        # 应用最佳缩放
-        if best_scale_combo is not None:
-            sx, sy = best_scale_combo
-            scale = (sx + sy) / 2.0
-            centroid = np.mean(current_arr)
-            current_arr = centroid + (current_arr - centroid) * scale
-            
-            best_x, best_y = cs.decode(
-                {fv: float(current_arr[j]) for j, fv in enumerate(free_vars)})
-            
-            _, new_hpwl, new_area, new_overlap = compute_cost(problem, best_x, best_y)
-            best_cost = best_scale_cost
-            improved = True
-            
-            print(f"    压缩 iter={iteration}, scale=({sx:.2f},{sy:.2f}): "
-                  f"cost={best_cost:.1f}, area={new_area:.1f}, hpwl={new_hpwl:.1f}, "
-                  f"overlap={new_overlap:.2f}")
-    
-    print(f"    压缩后: cost={best_cost:.1f}, 改善={100*(1-best_cost/(10*hpwl0+area0)):.1f}%")
-    return best_x, best_y
-
-
-def solve(problem: Problem, time_limit: float = 115.0,
-          strategies: List[str] = None) -> Dict[str, Any]:
-    """
-    求解布局问题。
-
-    Args:
-        problem: 布局问题实例
-        time_limit: 时间限制(秒)
-        strategies: 初始化策略序列,如 ['quadratic_placement', 'network_aware']
-                   如果为 None,使用默认策略序列
-
-    Returns:
-        dict with keys: box_position, cost, hpwl, area, overlap, violations, elapsed_seconds
-    """
-    t0 = time.time()
-
-    # 1. 约束化简
-    cs = ConstraintSystem(problem)
-    print(f"约束化简: {problem.n} boxes -> {len(cs.free_vars)} 独立变量")
-
-    # 2. 模拟退火
-    sa = SimulatedAnnealing(problem, cs, time_limit=time_limit)
-    x_coords, y_coords, cost = sa.run(strategies=strategies)
-
-    # 3. 后处理去重叠
-    remaining = time_limit - (time.time() - t0)
-    if remaining > 1.0:
-        print("后处理: 去重叠微调...")
-        x_coords, y_coords = _postprocess(problem, cs, x_coords, y_coords,
-                                           remaining_time=remaining)
-
-    # 4. 全局压缩后处理
-    remaining = time_limit - (time.time() - t0)
-    if remaining > 2.0:
-        print("后处理: 全局压缩...")
-        x_coords, y_coords = _compress_layout(problem, cs, x_coords, y_coords,
-                                              remaining_time=remaining)
-
-    # 5. 验证
-    violations = validate_layout(problem, x_coords, y_coords)
-    elapsed = time.time() - t0
-
-    _, hpwl, area, overlap = compute_cost(problem, x_coords, y_coords)
-    real_cost = 10 * hpwl + area
-
-    if not violations:
-        print("✅ 所有约束满足")
-    else:
-        print(f"⚠️ 约束违反 ({len(violations)} 条)")
-
-    box_position = [[round(x_coords[i], 4), round(y_coords[i], 4)]
-                    for i in range(problem.n)]
-
-    return {
-        "box_position": box_position,
-        "cost": round(real_cost, 4),
-        "hpwl": round(hpwl, 4),
-        "area": round(area, 4),
-        "overlap": round(overlap, 4),
-        "violations": violations,
-        "elapsed_seconds": round(elapsed, 2),
-    }
-
 
 def _postprocess(problem: Problem, cs: ConstraintSystem,
                  x_coords: List[float], y_coords: List[float],
@@ -1273,3 +967,161 @@ def _postprocess(problem: Problem, cs: ConstraintSystem,
         step *= 0.999
 
     return best_x, best_y
+
+
+def _compress_layout(problem: Problem, cs: ConstraintSystem, 
+                     x_coords: List[float], y_coords: List[float],
+                     remaining_time: float = 5.0) -> Tuple[List[float], List[float]]:
+    """
+    全局压缩后处理：仅在能改善总成本时应用
+    """
+    free_vars = sorted(cs.free_vars)
+    num_vars = len(free_vars)
+
+    # 将当前坐标映射回自由变量
+    A = np.zeros((2 * problem.n, num_vars))
+    b_vec = np.zeros(2 * problem.n)
+
+    for i in range(problem.n):
+        expr_x = cs.var_exprs[i]
+        for j, fv in enumerate(free_vars):
+            A[i, j] = expr_x.coeffs.get(fv, 0.0)
+        b_vec[i] = x_coords[i] - expr_x.const
+        expr_y = cs.var_exprs[problem.n + i]
+        for j, fv in enumerate(free_vars):
+            A[problem.n + i, j] = expr_y.coeffs.get(fv, 0.0)
+        b_vec[problem.n + i] = y_coords[i] - expr_y.const
+
+    result, _, _, _ = np.linalg.lstsq(A, b_vec, rcond=None)
+    current_arr = result
+
+    best_x, best_y = cs.decode(
+        {fv: float(current_arr[j]) for j, fv in enumerate(free_vars)})
+    _, hpwl0, area0, overlap0 = compute_cost(problem, x_coords, y_coords)
+    _, new_hpwl, new_area, new_overlap = compute_cost(problem, best_x, best_y)
+    best_cost = 10 * new_hpwl + new_area
+    initial_cost = 10 * hpwl0 + area0
+
+    print(f"    压缩前: cost={best_cost:.1f}, area={area0:.1f}, hpwl={hpwl0:.1f}, overlap={overlap0:.2f}")
+
+    t0 = time.time()
+    improved = True
+    iteration = 0
+
+    while improved and (time.time() - t0) < remaining_time:
+        improved = False
+        iteration += 1
+        
+        # 尝试多种缩放比例
+        scales_x = [0.99, 0.98, 0.97, 0.96, 0.95, 1.00, 1.01, 1.02]
+        scales_y = [0.99, 0.98, 0.97, 0.96, 0.95, 1.00, 1.01, 1.02]
+        
+        best_scale_combo = None
+        best_scale_cost = best_cost
+        
+        for sx in scales_x:
+            for sy in scales_y:
+                if sx == 1.00 and sy == 1.00:
+                    continue
+                if time.time() - t0 > remaining_time * 0.85:
+                    break
+                
+                # 分别缩放x和y方向的变量
+                new_arr = current_arr.copy()
+                # 简化：统一缩放（因为变量混合了x和y）
+                scale = (sx + sy) / 2.0
+                centroid = np.mean(current_arr)
+                new_arr = centroid + (current_arr - centroid) * scale
+                
+                new_x, new_y = cs.decode(
+                    {fv: float(new_arr[j]) for j, fv in enumerate(free_vars)})
+                
+                # 检查重叠
+                overlap = compute_overlap_penalty(problem, new_x, new_y)
+                if overlap > 15.0:  # 允许少量重叠
+                    continue
+                
+                _, new_hpwl, new_area, new_overlap = compute_cost(problem, new_x, new_y)
+                new_cost = 10 * new_hpwl + new_area
+                
+                # 如果改善超过0.5%，记录下来
+                if new_cost < best_scale_cost * 0.995:
+                    best_scale_cost = new_cost
+                    best_scale_combo = (sx, sy)
+        
+        # 应用最佳缩放
+        if best_scale_combo is not None:
+            sx, sy = best_scale_combo
+            scale = (sx + sy) / 2.0
+            centroid = np.mean(current_arr)
+            current_arr = centroid + (current_arr - centroid) * scale
+            
+            best_x, best_y = cs.decode(
+                {fv: float(current_arr[j]) for j, fv in enumerate(free_vars)})
+            
+            _, new_hpwl, new_area, new_overlap = compute_cost(problem, best_x, best_y)
+            best_cost = best_scale_cost
+            improved = True
+            
+            print(f"    压缩 iter={iteration}, scale=({sx:.2f},{sy:.2f}): "
+                  f"cost={best_cost:.1f}, area={new_area:.1f}, hpwl={new_hpwl:.1f}, "
+                  f"overlap={new_overlap:.2f}")
+    
+    print(f"    压缩后: cost={best_cost:.1f}, 改善={100*(1-best_cost/(10*hpwl0+area0)):.1f}%")
+    return best_x, best_y
+
+
+# ============================================================
+# 求解入口
+# ============================================================
+
+def solve(problem: Problem, time_limit: float = 115.0,
+          strategies: List[str] = None) -> Dict[str, Any]:
+    """
+    求解布局问题（纯算法，无 I/O 副作用，仅保留必要的维测打印）。
+
+    Args:
+        problem: 布局问题实例
+        time_limit: 时间限制(秒)
+        strategies: 初始化策略序列
+
+    Returns:
+        dict with keys: box_position, cost, hpwl, area, overlap, elapsed_seconds
+    """
+    t0 = time.time()
+
+    # 1. 约束化简
+    cs = ConstraintSystem(problem)
+    print(f"约束化简: {problem.n} boxes -> {len(cs.free_vars)} 独立变量")
+
+    # 2. 模拟退火
+    sa = SimulatedAnnealing(problem, cs, time_limit=time_limit)
+    x_coords, y_coords, cost = sa.run(strategies=strategies)
+
+    # 3. 后处理去重叠
+    remaining = time_limit - (time.time() - t0)
+    if remaining > 1.0:
+        x_coords, y_coords = _postprocess(problem, cs, x_coords, y_coords,
+                                           remaining_time=remaining)
+
+    # 4. 全局压缩后处理
+    remaining = time_limit - (time.time() - t0)
+    if remaining > 2.0:
+        x_coords, y_coords = _compress_layout(problem, cs, x_coords, y_coords,
+                                              remaining_time=remaining)
+
+    elapsed = time.time() - t0
+    _, hpwl, area, overlap = compute_cost(problem, x_coords, y_coords)
+    real_cost = 10 * hpwl + area
+
+    box_position = [[round(x_coords[i], 4), round(y_coords[i], 4)]
+                    for i in range(problem.n)]
+
+    return {
+        "box_position": box_position,
+        "cost": round(real_cost, 4),
+        "hpwl": round(hpwl, 4),
+        "area": round(area, 4),
+        "overlap": round(overlap, 4),
+        "elapsed_seconds": round(elapsed, 2),
+    }
