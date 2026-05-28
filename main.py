@@ -46,6 +46,113 @@ from route import (Problem, ConstraintSystem, SimulatedAnnealing,
                    compute_overlap_penalty)
 
 
+# ============================================================
+# 输入合法性检查
+# ============================================================
+
+def validate_input(data: Dict[str, Any], eps: float = 1e-6):
+    """
+    检查输入数据的合法性和可解性。
+    
+    检查项:
+    1. 矩形 ID 范围：所有约束引用的 ID 必须在 [1, n] 范围内
+    2. 对称组：
+       - symmetry_pair 中两个矩形尺寸必须相同
+       - self_symmetry 矩形必须存在
+    3. 重复组：
+       - 每个 group 的矩形个数必须相同
+       - 对应位置的矩形尺寸必须相同
+    
+    Raises:
+        ValueError: 输入数据存在根本矛盾，无解
+    """
+    widths = [s[0] for s in data["box_size"]]
+    heights = [s[1] for s in data["box_size"]]
+    n = len(widths)
+    
+    def check_id(box_id, context):
+        """检查矩形 ID 是否在有效范围内"""
+        if box_id < 1 or box_id > n:
+            raise ValueError(
+                f"{context}中引用的 box {box_id} 超出范围 [1, {n}]"
+            )
+    
+    # --- 1. 检查对称组 ---
+    for axis in ["symmetry_x", "symmetry_y"]:
+        for group in data.get(axis, []):
+            # 检查 symmetry_pair
+            for pair in group.get("symmetry_pair", []):
+                if len(pair) != 2:
+                    raise ValueError(
+                        f"{axis} 的 symmetry_pair 必须是二元组，得到 {pair}"
+                    )
+                i, j = pair
+                check_id(i, f"{axis} symmetry_pair")
+                check_id(j, f"{axis} symmetry_pair")
+                
+                # 对称的两个矩形尺寸必须相同
+                if abs(widths[i-1] - widths[j-1]) > eps or abs(heights[i-1] - heights[j-1]) > eps:
+                    raise ValueError(
+                        f"{axis} 对称组尺寸矛盾：box {i} 尺寸为 [{widths[i-1]}, {heights[i-1]}]，"
+                        f"box {j} 尺寸为 [{widths[j-1]}, {heights[j-1]}]。"
+                        f"对称约束要求两个矩形尺寸必须相同。"
+                    )
+            
+            # 检查 self_symmetry
+            for s in group.get("self_symmetry", []):
+                check_id(s, f"{axis} self_symmetry")
+    
+    # --- 2. 检查重复组 ---
+    repeat_groups = [rg["groups"] for rg in data.get("repeat_groups", [])]
+    
+    for rg in repeat_groups:
+        if len(rg) < 2:
+            continue
+        
+        ref_group = rg[0]
+        ref_len = len(ref_group)
+        
+        # 检查所有引用 ID
+        for box_id in ref_group:
+            check_id(box_id, "重复组")
+        
+        for g_idx in range(1, len(rg)):
+            group = rg[g_idx]
+            
+            # 检查每个 group 的矩形个数必须相同
+            if len(group) != ref_len:
+                raise ValueError(
+                    f"重复组结构错误：参考组有 {ref_len} 个矩形 {ref_group}，"
+                    f"但组 {g_idx} 有 {len(group)} 个矩形 {group}，个数不一致"
+                )
+            
+            # 检查引用 ID
+            for box_id in group:
+                check_id(box_id, "重复组")
+            
+            # 检查对应位置的矩形尺寸必须相同
+            for pos, (ref_box_id, box_id) in enumerate(zip(ref_group, group)):
+                ref_w, ref_h = widths[ref_box_id - 1], heights[ref_box_id - 1]
+                box_w, box_h = widths[box_id - 1], heights[box_id - 1]
+                if abs(ref_w - box_w) > eps or abs(ref_h - box_h) > eps:
+                    raise ValueError(
+                        f"重复组尺寸矛盾：参考组的 box {ref_box_id} 尺寸为 [{ref_w}, {ref_h}]，"
+                        f"但组 {g_idx} 的 box {box_id} 尺寸为 [{box_w}, {box_h}]。"
+                        f"重复组要求对应位置的 box 尺寸必须相同，此问题无解。"
+                    )
+    
+    # --- 3. 检查对齐约束 ---
+    align = data.get("align", {})
+    for direction, groups in align.items():
+        for group in groups:
+            for box_id in group:
+                check_id(box_id, f"align.{direction}")
+    
+    # --- 4. 检查网络约束 ---
+    for net_id, net in enumerate(data.get("nets", [])):
+        for box_id in net:
+            check_id(box_id, f"nets[{net_id}]")
+
 def solve_and_report(problem: Problem, time_limit: float = 115.0,
                      strategies: List[str] = None) -> Dict[str, Any]:
     """
@@ -545,15 +652,17 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
     if expected_only:
         return result
 
-    # --- 2. 运行算法 ---
+    # --- 2. 验证输入合法性 ---
     try:
-        problem = Problem(input_data)
+        validate_input(input_data)
     except ValueError as e:
         # 无解用例（如重复组尺寸矛盾）
         result["unsolvable"] = True
         result["unsolvable_reason"] = str(e)
         return result
 
+    # --- 3. 运行算法 ---
+    problem = Problem(input_data)
     solve_result = solve_and_report(problem, time_limit=time_limit)
     elapsed = solve_result["elapsed_seconds"]
 

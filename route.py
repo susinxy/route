@@ -45,47 +45,6 @@ class Problem:
         ]
 
         self.nets: List[List[int]] = data.get("nets", [])
-        
-        # 验证重复组的尺寸一致性
-        self._validate_repeat_groups()
-    
-    def _validate_repeat_groups(self):
-        """
-        验证重复组的尺寸一致性。
-        
-        重复组约束 [[a, b, ...], [c, d, ...]] 要求：
-        - 对应位置的 box 尺寸必须相同：a与c、b与d、...
-        - 组内的相对位置偏移相同
-        
-        如果尺寸不一致，说明输入数据存在根本矛盾，无解。
-        """
-        for rg in self.repeat_groups:
-            if len(rg) < 2:
-                continue
-            
-            ref_group = rg[0]  # 参考组
-            for g_idx in range(1, len(rg)):
-                group = rg[g_idx]  # 待检查组
-                
-                if len(ref_group) != len(group):
-                    raise ValueError(
-                        f"重复组结构错误：参考组 {ref_group} 有 {len(ref_group)} 个元素，"
-                        f"但组 {group} 有 {len(group)} 个元素，长度不一致"
-                    )
-                
-                # 检查对应位置的 box 尺寸是否相同
-                for pos, (ref_box_id, box_id) in enumerate(zip(ref_group, group)):
-                    ref_w = self.widths[ref_box_id - 1]
-                    ref_h = self.heights[ref_box_id - 1]
-                    box_w = self.widths[box_id - 1]
-                    box_h = self.heights[box_id - 1]
-                    
-                    if abs(ref_w - box_w) > 1e-6 or abs(ref_h - box_h) > 1e-6:
-                        raise ValueError(
-                            f"重复组尺寸矛盾：参考组的 box {ref_box_id} 尺寸为 [{ref_w}, {ref_h}]，"
-                            f"但组 {g_idx} 的 box {box_id} 尺寸为 [{box_w}, {box_h}]。"
-                            f"重复组要求对应位置的 box 尺寸必须相同，此问题无解。"
-                        )
 
 
 # ============================================================
