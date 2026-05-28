@@ -37,7 +37,7 @@ import glob
 import time
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -49,6 +49,98 @@ from route import (Problem, ConstraintSystem, SimulatedAnnealing,
 # ============================================================
 # 输入合法性检查
 # ============================================================
+
+def _check_id(box_id: int, n: int, context: str):
+    """检查矩形 ID 是否在有效范围内"""
+    if box_id < 1 or box_id > n:
+        raise ValueError(f"{context}中引用的 box {box_id} 超出范围 [1, {n}]")
+
+
+def _check_symmetry_groups(data: Dict[str, Any], widths: List[float], 
+                           heights: List[float], n: int, eps: float):
+    """检查对称组约束的合法性"""
+    for axis in ["symmetry_x", "symmetry_y"]:
+        for group in data.get(axis, []):
+            # 检查 symmetry_pair
+            for pair in group.get("symmetry_pair", []):
+                if len(pair) != 2:
+                    raise ValueError(
+                        f"{axis} 的 symmetry_pair 必须是二元组，得到 {pair}"
+                    )
+                i, j = pair
+                _check_id(i, n, f"{axis} symmetry_pair")
+                _check_id(j, n, f"{axis} symmetry_pair")
+                
+                # 对称的两个矩形尺寸必须相同
+                if abs(widths[i-1] - widths[j-1]) > eps or abs(heights[i-1] - heights[j-1]) > eps:
+                    raise ValueError(
+                        f"{axis} 对称组尺寸矛盾：box {i} 尺寸为 [{widths[i-1]}, {heights[i-1]}]，"
+                        f"box {j} 尺寸为 [{widths[j-1]}, {heights[j-1]}]。"
+                        f"对称约束要求两个矩形尺寸必须相同。"
+                    )
+            
+            # 检查 self_symmetry
+            for s in group.get("self_symmetry", []):
+                _check_id(s, n, f"{axis} self_symmetry")
+
+
+def _check_repeat_groups(data: Dict[str, Any], widths: List[float], 
+                         heights: List[float], n: int, eps: float):
+    """检查重复组约束的合法性"""
+    repeat_groups = [rg["groups"] for rg in data.get("repeat_groups", [])]
+    
+    for rg in repeat_groups:
+        if len(rg) < 2:
+            continue
+        
+        ref_group = rg[0]
+        ref_len = len(ref_group)
+        
+        # 检查所有引用 ID
+        for box_id in ref_group:
+            _check_id(box_id, n, "重复组")
+        
+        for g_idx in range(1, len(rg)):
+            group = rg[g_idx]
+            
+            # 检查每个 group 的矩形个数必须相同
+            if len(group) != ref_len:
+                raise ValueError(
+                    f"重复组结构错误：参考组有 {ref_len} 个矩形 {ref_group}，"
+                    f"但组 {g_idx} 有 {len(group)} 个矩形 {group}，个数不一致"
+                )
+            
+            # 检查引用 ID
+            for box_id in group:
+                _check_id(box_id, n, "重复组")
+            
+            # 检查对应位置的矩形尺寸必须相同
+            for ref_box_id, box_id in zip(ref_group, group):
+                ref_w, ref_h = widths[ref_box_id - 1], heights[ref_box_id - 1]
+                box_w, box_h = widths[box_id - 1], heights[box_id - 1]
+                if abs(ref_w - box_w) > eps or abs(ref_h - box_h) > eps:
+                    raise ValueError(
+                        f"重复组尺寸矛盾：参考组的 box {ref_box_id} 尺寸为 [{ref_w}, {ref_h}]，"
+                        f"但组 {g_idx} 的 box {box_id} 尺寸为 [{box_w}, {box_h}]。"
+                        f"重复组要求对应位置的 box 尺寸必须相同，此问题无解。"
+                    )
+
+
+def _check_alignment_constraints(data: Dict[str, Any], n: int):
+    """检查对齐约束的 ID 合法性"""
+    align = data.get("align", {})
+    for direction, groups in align.items():
+        for group in groups:
+            for box_id in group:
+                _check_id(box_id, n, f"align.{direction}")
+
+
+def _check_network_constraints(data: Dict[str, Any], n: int):
+    """检查网络约束的 ID 合法性"""
+    for net_id, net in enumerate(data.get("nets", [])):
+        for box_id in net:
+            _check_id(box_id, n, f"nets[{net_id}]")
+
 
 def validate_input(data: Dict[str, Any], eps: float = 1e-6):
     """
@@ -70,88 +162,10 @@ def validate_input(data: Dict[str, Any], eps: float = 1e-6):
     heights = [s[1] for s in data["box_size"]]
     n = len(widths)
     
-    def check_id(box_id, context):
-        """检查矩形 ID 是否在有效范围内"""
-        if box_id < 1 or box_id > n:
-            raise ValueError(
-                f"{context}中引用的 box {box_id} 超出范围 [1, {n}]"
-            )
-    
-    # --- 1. 检查对称组 ---
-    for axis in ["symmetry_x", "symmetry_y"]:
-        for group in data.get(axis, []):
-            # 检查 symmetry_pair
-            for pair in group.get("symmetry_pair", []):
-                if len(pair) != 2:
-                    raise ValueError(
-                        f"{axis} 的 symmetry_pair 必须是二元组，得到 {pair}"
-                    )
-                i, j = pair
-                check_id(i, f"{axis} symmetry_pair")
-                check_id(j, f"{axis} symmetry_pair")
-                
-                # 对称的两个矩形尺寸必须相同
-                if abs(widths[i-1] - widths[j-1]) > eps or abs(heights[i-1] - heights[j-1]) > eps:
-                    raise ValueError(
-                        f"{axis} 对称组尺寸矛盾：box {i} 尺寸为 [{widths[i-1]}, {heights[i-1]}]，"
-                        f"box {j} 尺寸为 [{widths[j-1]}, {heights[j-1]}]。"
-                        f"对称约束要求两个矩形尺寸必须相同。"
-                    )
-            
-            # 检查 self_symmetry
-            for s in group.get("self_symmetry", []):
-                check_id(s, f"{axis} self_symmetry")
-    
-    # --- 2. 检查重复组 ---
-    repeat_groups = [rg["groups"] for rg in data.get("repeat_groups", [])]
-    
-    for rg in repeat_groups:
-        if len(rg) < 2:
-            continue
-        
-        ref_group = rg[0]
-        ref_len = len(ref_group)
-        
-        # 检查所有引用 ID
-        for box_id in ref_group:
-            check_id(box_id, "重复组")
-        
-        for g_idx in range(1, len(rg)):
-            group = rg[g_idx]
-            
-            # 检查每个 group 的矩形个数必须相同
-            if len(group) != ref_len:
-                raise ValueError(
-                    f"重复组结构错误：参考组有 {ref_len} 个矩形 {ref_group}，"
-                    f"但组 {g_idx} 有 {len(group)} 个矩形 {group}，个数不一致"
-                )
-            
-            # 检查引用 ID
-            for box_id in group:
-                check_id(box_id, "重复组")
-            
-            # 检查对应位置的矩形尺寸必须相同
-            for pos, (ref_box_id, box_id) in enumerate(zip(ref_group, group)):
-                ref_w, ref_h = widths[ref_box_id - 1], heights[ref_box_id - 1]
-                box_w, box_h = widths[box_id - 1], heights[box_id - 1]
-                if abs(ref_w - box_w) > eps or abs(ref_h - box_h) > eps:
-                    raise ValueError(
-                        f"重复组尺寸矛盾：参考组的 box {ref_box_id} 尺寸为 [{ref_w}, {ref_h}]，"
-                        f"但组 {g_idx} 的 box {box_id} 尺寸为 [{box_w}, {box_h}]。"
-                        f"重复组要求对应位置的 box 尺寸必须相同，此问题无解。"
-                    )
-    
-    # --- 3. 检查对齐约束 ---
-    align = data.get("align", {})
-    for direction, groups in align.items():
-        for group in groups:
-            for box_id in group:
-                check_id(box_id, f"align.{direction}")
-    
-    # --- 4. 检查网络约束 ---
-    for net_id, net in enumerate(data.get("nets", [])):
-        for box_id in net:
-            check_id(box_id, f"nets[{net_id}]")
+    _check_symmetry_groups(data, widths, heights, n, eps)
+    _check_repeat_groups(data, widths, heights, n, eps)
+    _check_alignment_constraints(data, n)
+    _check_network_constraints(data, n)
 
 def solve_and_report(problem: Problem, time_limit: float = 115.0,
                      strategies: List[str] = None) -> Dict[str, Any]:
@@ -292,9 +306,199 @@ def validate_layout(problem: Problem, x: List[float], y: List[float],
     return violations
 
 
-# ============================================================
-# 详细约束验证 (用于测试报告)
-# ============================================================
+def _verify_x_symmetry_constraint(data: Dict[str, Any], x: List[float], y: List[float],
+                                   widths: List[float], eps: float) -> Tuple[List[str], List[str]]:
+    """验证 X 轴对称约束，返回 (violations, details)"""
+    violations = []
+    details = []
+    
+    for gi, group in enumerate(data.get("symmetry_x", [])):
+        axis_vals = []
+        for pair in group.get("symmetry_pair", []):
+            i, j = pair[0] - 1, pair[1] - 1
+            mid = (x[i] + widths[i] / 2 + x[j] + widths[j] / 2) / 2
+            axis_vals.append(mid)
+        for s in group.get("self_symmetry", []):
+            axis_vals.append(x[s - 1] + widths[s - 1] / 2)
+
+        if axis_vals:
+            axis = sum(axis_vals) / len(axis_vals)
+            group_ok = True
+            for pair in group.get("symmetry_pair", []):
+                i, j = pair[0] - 1, pair[1] - 1
+                mid = (x[i] + widths[i] / 2 + x[j] + widths[j] / 2) / 2
+                if abs(mid - axis) > eps:
+                    v = f"  X对称: box {pair[0]} & {pair[1]}, mid={mid:.3f}, axis={axis:.3f}, diff={abs(mid-axis):.6f}"
+                    violations.append(v)
+                    details.append(v)
+                    group_ok = False
+                if abs(y[i] - y[j]) > eps:
+                    v = f"  X对称 y不等: box {pair[0]} y={y[i]:.3f}, box {pair[1]} y={y[j]:.3f}"
+                    violations.append(v)
+                    details.append(v)
+                    group_ok = False
+            for s in group.get("self_symmetry", []):
+                si = s - 1
+                if abs(x[si] + widths[si] / 2 - axis) > eps:
+                    v = f"  X自对称: box {s}, center={x[si]+widths[si]/2:.3f}, axis={axis:.3f}"
+                    violations.append(v)
+                    details.append(v)
+                    group_ok = False
+            if group_ok:
+                details.append(f"  X对称组{gi}: ✓ (axis={axis:.3f})")
+    
+    return violations, details
+
+
+def _verify_y_symmetry_constraint(data: Dict[str, Any], x: List[float], y: List[float],
+                                   heights: List[float], eps: float) -> Tuple[List[str], List[str]]:
+    """验证 Y 轴对称约束，返回 (violations, details)"""
+    violations = []
+    details = []
+    
+    for gi, group in enumerate(data.get("symmetry_y", [])):
+        axis_vals = []
+        for pair in group.get("symmetry_pair", []):
+            i, j = pair[0] - 1, pair[1] - 1
+            mid = (y[i] + heights[i] / 2 + y[j] + heights[j] / 2) / 2
+            axis_vals.append(mid)
+        for s in group.get("self_symmetry", []):
+            axis_vals.append(y[s - 1] + heights[s - 1] / 2)
+
+        if axis_vals:
+            axis = sum(axis_vals) / len(axis_vals)
+            group_ok = True
+            for pair in group.get("symmetry_pair", []):
+                i, j = pair[0] - 1, pair[1] - 1
+                mid = (y[i] + heights[i] / 2 + y[j] + heights[j] / 2) / 2
+                if abs(mid - axis) > eps:
+                    v = f"  Y对称: box {pair[0]} & {pair[1]}, mid={mid:.3f}, axis={axis:.3f}, diff={abs(mid-axis):.6f}"
+                    violations.append(v)
+                    details.append(v)
+                    group_ok = False
+                if abs(x[i] - x[j]) > eps:
+                    v = f"  Y对称 x不等: box {pair[0]} x={x[i]:.3f}, box {pair[1]} x={x[j]:.3f}"
+                    violations.append(v)
+                    details.append(v)
+                    group_ok = False
+            for s in group.get("self_symmetry", []):
+                si = s - 1
+                if abs(y[si] + heights[si] / 2 - axis) > eps:
+                    v = f"  Y自对称: box {s}, center={y[si]+heights[si]/2:.3f}, axis={axis:.3f}"
+                    violations.append(v)
+                    details.append(v)
+                    group_ok = False
+            if group_ok:
+                details.append(f"  Y对称组{gi}: ✓ (axis={axis:.3f})")
+    
+    return violations, details
+
+
+def _verify_alignment_constraint(data: Dict[str, Any], x: List[float], y: List[float],
+                                  widths: List[float], heights: List[float], eps: float) -> Tuple[List[str], List[str]]:
+    """验证对齐约束，返回 (violations, details)"""
+    violations = []
+    details = []
+    
+    align = data.get("align", {})
+    for direction, groups in [("left", align.get("left", [])),
+                               ("right", align.get("right", [])),
+                               ("top", align.get("top", [])),
+                               ("bottom", align.get("bottom", []))]:
+        for gi, grp in enumerate(groups):
+            if not grp:
+                continue
+            boxes = [b - 1 for b in grp]
+            if direction == "left":
+                vals = [x[b] for b in boxes]
+            elif direction == "right":
+                vals = [x[b] + widths[b] for b in boxes]
+            elif direction == "top":
+                vals = [y[b] + heights[b] for b in boxes]
+            elif direction == "bottom":
+                vals = [y[b] for b in boxes]
+
+            spread = max(vals) - min(vals)
+            if spread > eps:
+                v = f"  {direction}对齐: boxes {grp}, spread={spread:.6f}"
+                violations.append(v)
+                details.append(v)
+            else:
+                details.append(f"  {direction}对齐 boxes{grp}: ✓ (val={vals[0]:.3f})")
+    
+    return violations, details
+
+
+def _verify_repeat_group_constraint(data: Dict[str, Any], x: List[float], y: List[float],
+                                     widths: List[float], heights: List[float], eps: float) -> Tuple[List[str], List[str]]:
+    """验证重复组约束，返回 (violations, details)"""
+    violations = []
+    details = []
+    
+    for rgi, rg in enumerate(data.get("repeat_groups", [])):
+        groups = [[b - 1 for b in grp] for grp in rg.get("groups", [])]
+        if len(groups) < 2:
+            continue
+        ref = groups[0]
+        rg_ok = True
+        
+        # 检查对应位置的 box 尺寸是否相同
+        for ig in range(1, len(groups)):
+            grp = groups[ig]
+            for j, (ref_box, box) in enumerate(zip(ref, grp)):
+                ref_w = widths[ref_box]
+                ref_h = heights[ref_box]
+                box_w = widths[box]
+                box_h = heights[box]
+                if abs(ref_w - box_w) > eps or abs(ref_h - box_h) > eps:
+                    v = (f"  重复组{rgi}尺寸矛盾: box {ref_box+1} [{ref_w}x{ref_h}] "
+                         f"与 box {box+1} [{box_w}x{box_h}] 尺寸不同")
+                    violations.append(v)
+                    details.append(v)
+                    rg_ok = False
+        
+        # 检查位置偏移一致性
+        ref_offsets = [(x[b] - x[ref[0]], y[b] - y[ref[0]]) for b in ref]
+        for ig in range(1, len(groups)):
+            grp = groups[ig]
+            grp_offsets = [(x[b] - x[grp[0]], y[b] - y[grp[0]]) for b in grp]
+            for j in range(len(ref)):
+                dx_ref, dy_ref = ref_offsets[j]
+                dx_grp, dy_grp = grp_offsets[j]
+                if abs(dx_ref - dx_grp) > eps or abs(dy_ref - dy_grp) > eps:
+                    v = (f"  重复组{rgi}: box {grp[j]+1} 偏移不一致 "
+                         f"ref=({dx_ref:.3f},{dy_ref:.3f}) "
+                         f"grp=({dx_grp:.3f},{dy_grp:.3f})")
+                    violations.append(v)
+                    details.append(v)
+                    rg_ok = False
+        if rg_ok:
+            details.append(f"  重复组{rgi}: ✓")
+    
+    return violations, details
+
+
+def _verify_no_overlap_constraint(n: int, x: List[float], y: List[float],
+                                   widths: List[float], heights: List[float], eps: float) -> Tuple[List[str], List[str]]:
+    """验证无重叠约束，返回 (violations, details)"""
+    violations = []
+    details = []
+    
+    overlap_count = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            ox = min(x[i] + widths[i], x[j] + widths[j]) - max(x[i], x[j])
+            oy = min(y[i] + heights[i], y[j] + heights[j]) - max(y[i], y[j])
+            if ox > eps and oy > eps:
+                v = f"  重叠: box {i+1} & {j+1}, overlap=({ox:.3f}x{oy:.3f}={ox*oy:.3f})"
+                violations.append(v)
+                details.append(v)
+                overlap_count += 1
+    if overlap_count == 0:
+        details.append("  无重叠: ✓")
+    
+    return violations, details
+
 
 def verify_all_constraints(data: Dict[str, Any], positions: List[List[float]],
                            label: str = "", eps: float = 1e-3) -> Dict[str, Any]:
@@ -330,161 +534,32 @@ def verify_all_constraints(data: Dict[str, Any], positions: List[List[float]],
         "overlap": []
     }
 
-    # ---- 1. X轴对称 ----
-    for gi, group in enumerate(data.get("symmetry_x", [])):
-        axis_vals = []
-        for pair in group.get("symmetry_pair", []):
-            i, j = pair[0] - 1, pair[1] - 1
-            mid = (x[i] + widths[i] / 2 + x[j] + widths[j] / 2) / 2
-            axis_vals.append(mid)
-        for s in group.get("self_symmetry", []):
-            axis_vals.append(x[s - 1] + widths[s - 1] / 2)
+    # 1. X轴对称
+    v, d = _verify_x_symmetry_constraint(data, x, y, widths, eps)
+    violations.extend(v)
+    details["sym_x"] = d
 
-        if axis_vals:
-            axis = sum(axis_vals) / len(axis_vals)
-            group_ok = True
-            for pair in group.get("symmetry_pair", []):
-                i, j = pair[0] - 1, pair[1] - 1
-                mid = (x[i] + widths[i] / 2 + x[j] + widths[j] / 2) / 2
-                if abs(mid - axis) > eps:
-                    v = f"  X对称: box {pair[0]} & {pair[1]}, mid={mid:.3f}, axis={axis:.3f}, diff={abs(mid-axis):.6f}"
-                    violations.append(v)
-                    details["sym_x"].append(v)
-                    group_ok = False
-                if abs(y[i] - y[j]) > eps:
-                    v = f"  X对称 y不等: box {pair[0]} y={y[i]:.3f}, box {pair[1]} y={y[j]:.3f}"
-                    violations.append(v)
-                    details["sym_x"].append(v)
-                    group_ok = False
-            for s in group.get("self_symmetry", []):
-                si = s - 1
-                if abs(x[si] + widths[si] / 2 - axis) > eps:
-                    v = f"  X自对称: box {s}, center={x[si]+widths[si]/2:.3f}, axis={axis:.3f}"
-                    violations.append(v)
-                    details["sym_x"].append(v)
-                    group_ok = False
-            if group_ok:
-                details["sym_x"].append(f"  X对称组{gi}: ✓ (axis={axis:.3f})")
+    # 2. Y轴对称
+    v, d = _verify_y_symmetry_constraint(data, x, y, heights, eps)
+    violations.extend(v)
+    details["sym_y"] = d
 
-    # ---- 2. Y轴对称 ----
-    for gi, group in enumerate(data.get("symmetry_y", [])):
-        axis_vals = []
-        for pair in group.get("symmetry_pair", []):
-            i, j = pair[0] - 1, pair[1] - 1
-            mid = (y[i] + heights[i] / 2 + y[j] + heights[j] / 2) / 2
-            axis_vals.append(mid)
-        for s in group.get("self_symmetry", []):
-            axis_vals.append(y[s - 1] + heights[s - 1] / 2)
+    # 3. 对齐
+    v, d = _verify_alignment_constraint(data, x, y, widths, heights, eps)
+    violations.extend(v)
+    details["align"] = d
 
-        if axis_vals:
-            axis = sum(axis_vals) / len(axis_vals)
-            group_ok = True
-            for pair in group.get("symmetry_pair", []):
-                i, j = pair[0] - 1, pair[1] - 1
-                mid = (y[i] + heights[i] / 2 + y[j] + heights[j] / 2) / 2
-                if abs(mid - axis) > eps:
-                    v = f"  Y对称: box {pair[0]} & {pair[1]}, mid={mid:.3f}, axis={axis:.3f}, diff={abs(mid-axis):.6f}"
-                    violations.append(v)
-                    details["sym_y"].append(v)
-                    group_ok = False
-                if abs(x[i] - x[j]) > eps:
-                    v = f"  Y对称 x不等: box {pair[0]} x={x[i]:.3f}, box {pair[1]} x={x[j]:.3f}"
-                    violations.append(v)
-                    details["sym_y"].append(v)
-                    group_ok = False
-            for s in group.get("self_symmetry", []):
-                si = s - 1
-                if abs(y[si] + heights[si] / 2 - axis) > eps:
-                    v = f"  Y自对称: box {s}, center={y[si]+heights[si]/2:.3f}, axis={axis:.3f}"
-                    violations.append(v)
-                    details["sym_y"].append(v)
-                    group_ok = False
-            if group_ok:
-                details["sym_y"].append(f"  Y对称组{gi}: ✓ (axis={axis:.3f})")
+    # 4. 重复组
+    v, d = _verify_repeat_group_constraint(data, x, y, widths, heights, eps)
+    violations.extend(v)
+    details["repeat"] = d
 
-    # ---- 3. 对齐 ----
-    align = data.get("align", {})
-    for direction, groups in [("left", align.get("left", [])),
-                               ("right", align.get("right", [])),
-                               ("top", align.get("top", [])),
-                               ("bottom", align.get("bottom", []))]:
-        for gi, grp in enumerate(groups):
-            if not grp:
-                continue
-            boxes = [b - 1 for b in grp]
-            if direction == "left":
-                vals = [x[b] for b in boxes]
-            elif direction == "right":
-                vals = [x[b] + widths[b] for b in boxes]
-            elif direction == "top":
-                vals = [y[b] + heights[b] for b in boxes]
-            elif direction == "bottom":
-                vals = [y[b] for b in boxes]
+    # 5. 无重叠
+    v, d = _verify_no_overlap_constraint(n, x, y, widths, heights, eps)
+    violations.extend(v)
+    details["overlap"] = d
 
-            spread = max(vals) - min(vals)
-            if spread > eps:
-                v = f"  {direction}对齐: boxes {grp}, spread={spread:.6f}"
-                violations.append(v)
-                details["align"].append(v)
-            else:
-                details["align"].append(f"  {direction}对齐 boxes{grp}: ✓ (val={vals[0]:.3f})")
-
-    # ---- 4. 重复组 ----
-    for rgi, rg in enumerate(data.get("repeat_groups", [])):
-        groups = [[b - 1 for b in grp] for grp in rg.get("groups", [])]
-        if len(groups) < 2:
-            continue
-        ref = groups[0]
-        rg_ok = True
-        
-        # 4a. 检查对应位置的 box 尺寸是否相同
-        for ig in range(1, len(groups)):
-            grp = groups[ig]
-            for j, (ref_box, box) in enumerate(zip(ref, grp)):
-                ref_w = widths[ref_box]
-                ref_h = heights[ref_box]
-                box_w = widths[box]
-                box_h = heights[box]
-                if abs(ref_w - box_w) > eps or abs(ref_h - box_h) > eps:
-                    v = (f"  重复组{rgi}尺寸矛盾: box {ref_box+1} [{ref_w}x{ref_h}] "
-                         f"与 box {box+1} [{box_w}x{box_h}] 尺寸不同")
-                    violations.append(v)
-                    details["repeat"].append(v)
-                    rg_ok = False
-        
-        # 4b. 检查位置偏移一致性
-        ref_offsets = [(x[b] - x[ref[0]], y[b] - y[ref[0]]) for b in ref]
-        for ig in range(1, len(groups)):
-            grp = groups[ig]
-            grp_offsets = [(x[b] - x[grp[0]], y[b] - y[grp[0]]) for b in grp]
-            for j in range(len(ref)):
-                dx_ref, dy_ref = ref_offsets[j]
-                dx_grp, dy_grp = grp_offsets[j]
-                if abs(dx_ref - dx_grp) > eps or abs(dy_ref - dy_grp) > eps:
-                    v = (f"  重复组{rgi}: box {grp[j]+1} 偏移不一致 "
-                         f"ref=({dx_ref:.3f},{dy_ref:.3f}) "
-                         f"grp=({dx_grp:.3f},{dy_grp:.3f})")
-                    violations.append(v)
-                    details["repeat"].append(v)
-                    rg_ok = False
-        if rg_ok:
-            details["repeat"].append(f"  重复组{rgi}: ✓")
-
-    # ---- 5. 无重叠 ----
-    overlap_count = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            ox = min(x[i] + widths[i], x[j] + widths[j]) - max(x[i], x[j])
-            oy = min(y[i] + heights[i], y[j] + heights[j]) - max(y[i], y[j])
-            if ox > eps and oy > eps:
-                v = f"  重叠: box {i+1} & {j+1}, overlap=({ox:.3f}x{oy:.3f}={ox*oy:.3f})"
-                violations.append(v)
-                details["overlap"].append(v)
-                overlap_count += 1
-    if overlap_count == 0:
-        details["overlap"].append("  无重叠: ✓")
-
-    # ---- Cost 计算 ----
+    # Cost 计算
     cost_info = {}
     try:
         problem = Problem(data)
@@ -977,44 +1052,45 @@ def _run_test_suite(cases: List[str], time_limit: float, expected_only: bool,
 # Main
 # ============================================================
 
-def main():
-    time_limit = 115.0
-    input_files = []
-    strategies = None
-    validate = False
-    expected_only = False
-    verbose = False
-    list_cases = False
-    directory = None
-    filter_name = None
-    parallel = False
-    max_workers = None
-
-    # 解析命令行参数
-    args = []
+def _parse_arguments() -> Dict[str, Any]:
+    """Parse command line arguments"""
+    config = {
+        'time_limit': 115.0,
+        'strategies': None,
+        'validate': False,
+        'expected_only': False,
+        'verbose': False,
+        'list_cases': False,
+        'directory': None,
+        'parallel': False,
+        'max_workers': None,
+        'input_files': [],
+        'args': []
+    }
+    
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
         if arg == "--time" and i + 1 < len(sys.argv):
-            time_limit = float(sys.argv[i + 1])
+            config['time_limit'] = float(sys.argv[i + 1])
             i += 2
         elif arg == "--strategies" and i + 1 < len(sys.argv):
-            strategies = [s.strip() for s in sys.argv[i + 1].split(',')]
+            config['strategies'] = [s.strip() for s in sys.argv[i + 1].split(',')]
             i += 2
         elif arg == "--validate":
-            validate = True
+            config['validate'] = True
             i += 1
         elif arg == "--expected-only":
-            validate = True
-            expected_only = True
+            config['validate'] = True
+            config['expected_only'] = True
             i += 1
         elif arg == "--verbose" or arg == "-v":
-            verbose = True
+            config['verbose'] = True
             i += 1
         elif arg == "--parallel" or arg == "-j":
-            parallel = True
+            config['parallel'] = True
             if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit():
-                max_workers = int(sys.argv[i + 1])
+                config['max_workers'] = int(sys.argv[i + 1])
                 i += 2
             else:
                 i += 1
@@ -1022,138 +1098,176 @@ def main():
             print("可用的初始化策略:")
             for strategy in SimulatedAnnealing.get_available_strategies():
                 print(f"  - {strategy}")
-            return
+            sys.exit(0)
         elif arg == "--list-cases":
-            list_cases = True
+            config['list_cases'] = True
             i += 1
         elif arg == "-d" and i + 1 < len(sys.argv):
-            directory = sys.argv[i + 1]
+            config['directory'] = sys.argv[i + 1]
             i += 2
         elif arg == "-t":
-            args.append("-t")
+            config['args'].append("-t")
             i += 1
         else:
-            args.append(arg)
+            config['args'].append(arg)
             i += 1
+    
+    return config
 
-    # ---- 列出测试用例 ----
-    if list_cases:
+
+def _handle_list_cases():
+    """List available test cases"""
+    cases = discover_cases()
+    if not cases:
+        print(f"未找到测试用例 (目录: {TEST_CASES_DIR})")
+        return
+    print("可用测试用例:")
+    for f in cases:
+        data = load_case(f)
+        name = os.path.basename(f).replace(".json", "")
+        desc = data.get("description", "")
+        print(f"  {name}: {desc}")
+
+
+def _handle_directory_mode(config: Dict[str, Any]):
+    """Handle directory-based execution mode"""
+    directory = config['directory']
+    use_test_mode = config['validate'] or (directory and "test_cases" in directory)
+    
+    if use_test_mode:
+        # Test mode: case*.json files
+        cases = sorted(glob.glob(os.path.join(directory, "case*.json")))
+    else:
+        # Run mode: all JSON files
+        cases = sorted(glob.glob(os.path.join(directory, "*.json")))
+    
+    if not cases:
+        print(f"错误: 目录 {directory} 中没有找到 JSON 文件")
+        sys.exit(1)
+    
+    # Filter by names (support multiple names)
+    positional = [a for a in config['args'] if not a.startswith("-")]
+    if positional:
+        cases = [f for f in cases
+                 if any(name in os.path.basename(f) for name in positional)]
+    
+    if not cases:
+        print(f"未找到匹配的用例 (filter={positional})")
+        sys.exit(1)
+    
+    if use_test_mode:
+        # Test mode
+        _run_test_suite(cases, config['time_limit'], config['expected_only'],
+                        config['verbose'], config['parallel'], config['max_workers'])
+    else:
+        # Run mode
+        return cases
+    
+    return None
+
+
+def _handle_file_mode(config: Dict[str, Any]):
+    """Handle file-based execution mode"""
+    positional = [a for a in config['args'] if not a.startswith("-")]
+    first = positional[0]
+    
+    if os.path.isfile(first):
+        return positional
+    else:
+        # Treat as test_cases name filters
         cases = discover_cases()
-        if not cases:
-            print(f"未找到测试用例 (目录: {TEST_CASES_DIR})")
-            return
-        print("可用测试用例:")
-        for f in cases:
-            data = load_case(f)
-            name = os.path.basename(f).replace(".json", "")
-            desc = data.get("description", "")
-            print(f"  {name}: {desc}")
-        return
-
-    # ---- 内置测试用例 ----
-    if "-t" in args:
-        run_single_case(_builtin_test_case(), time_limit, "builtin_test", strategies,
-                        validate=validate)
-        return
-
-    # ---- 测试用例模式 (--validate 或目录在 test_cases 下) ----
-    use_test_mode = validate or (directory and "test_cases" in directory)
-
-    if directory:
-        if use_test_mode:
-            # 测试模式：目录下的 case*.json
-            cases = sorted(glob.glob(os.path.join(directory, "case*.json")))
-        else:
-            # 运行模式：目录下所有 JSON
-            cases = sorted(glob.glob(os.path.join(directory, "*.json")))
-
-        if not cases:
-            print(f"错误: 目录 {directory} 中没有找到 JSON 文件")
-            sys.exit(1)
-
-        # 过滤（支持多个名称）
-        positional = [a for a in args if not a.startswith("-")]
-        if positional:
-            cases = [f for f in cases
-                     if any(name in os.path.basename(f) for name in positional)]
-
-        if not cases:
-            print(f"未找到匹配的用例 (filter={positional})")
-            sys.exit(1)
-
-        if use_test_mode:
-            # 测试模式
-            _run_test_suite(cases, time_limit, expected_only, verbose,
-                            parallel, max_workers)
-        else:
-            # 运行模式
-            input_files = cases
-
-    elif args and not args[0].startswith("-"):
-        # 文件或名称
-        positional = args
-        first = positional[0]
-
-        if os.path.isfile(first):
-            input_files = positional
-        else:
-            # 当作 test_cases 下的名称过滤
-            cases = discover_cases(first)
-            if cases:
-                input_files = cases
-                use_test_mode = True
-            else:
-                print(f"错误: 文件 {first} 不存在，也没有匹配的测试用例")
-                sys.exit(1)
-
-    if not input_files:
-        print("Usage:")
-        print("  python main.py input.json [--time 115] [--strategies s1,s2]")
-        print("  python main.py case1.json case2.json [--time 115]")
-        print("  python main.py -d ./test_cases --validate [--time 30] [-j 4]")
-        print("  python main.py -d ./test_cases --expected-only")
-        print("  python main.py --validate case01 [--time 30]")
-        print("  python main.py -t [--time 30]")
-        print("  python main.py --list-cases")
-        print("  python main.py --list-strategies")
-        print("\nParallel mode:")
-        print("  python main.py -d ./test_cases --validate --time 30 -j 8  # 8 processes")
-        print("  python main.py -d ./test_cases --validate --time 30 -j    # auto (CPU count)")
+        if cases:
+            # Filter by any of the provided names
+            filtered = [f for f in cases
+                       if any(name in os.path.basename(f) for name in positional)]
+            if filtered:
+                return filtered
+        print(f"错误: 没有匹配的用例 (filter={positional})")
         sys.exit(1)
 
-    # ---- 运行模式 ----
-    if use_test_mode and not directory:
-        # 按名称过滤的测试用例
-        _run_test_suite(input_files, time_limit, expected_only, verbose,
-                        parallel, max_workers)
 
-    # 普通运行模式
+def _print_usage():
+    """Print usage information"""
+    print("Usage:")
+    print("  python main.py input.json [--time 115] [--strategies s1,s2]")
+    print("  python main.py case1.json case2.json [--time 115]")
+    print("  python main.py -d ./test_cases --validate [--time 30] [-j 4]")
+    print("  python main.py -d ./test_cases --expected-only")
+    print("  python main.py --validate case01 [--time 30]")
+    print("  python main.py -t [--time 30]")
+    print("  python main.py --list-cases")
+    print("  python main.py --list-strategies")
+    print("\nParallel mode:")
+    print("  python main.py -d ./test_cases --validate --time 30 -j 8  # 8 processes")
+    print("  python main.py -d ./test_cases --validate --time 30 -j    # auto (CPU count)")
+
+
+def _run_batch_cases(input_files: List[str], config: Dict[str, Any]):
+    """Run multiple cases in batch mode"""
+    print(f"=== 批量执行 {len(input_files)} 个用例 ===")
+    print(f"时间限制: {config['time_limit']}s/用例\n")
+    
+    results = []
+    for i, filepath in enumerate(input_files, 1):
+        print(f"\n{'='*60}")
+        print(f"用例 {i}/{len(input_files)}: {os.path.basename(filepath)}")
+        print('='*60)
+        
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            result = run_single_case(data, config['time_limit'], 
+                                   os.path.basename(filepath),
+                                   config['strategies'], config['validate'])
+            results.append((os.path.basename(filepath), result))
+        except Exception as e:
+            print(f"❌ 执行失败: {e}")
+            results.append((os.path.basename(filepath), None))
+    
+    print_run_summary(results)
+
+
+def main():
+    config = _parse_arguments()
+    
+    # List test cases
+    if config['list_cases']:
+        _handle_list_cases()
+        return
+    
+    # Built-in test case
+    if "-t" in config['args']:
+        run_single_case(_builtin_test_case(), config['time_limit'], 
+                       "builtin_test", config['strategies'], config['validate'])
+        return
+    
+    # Directory mode
+    if config['directory']:
+        input_files = _handle_directory_mode(config)
+        if input_files is None:
+            return
+    elif config['args'] and not config['args'][0].startswith("-"):
+        # File mode
+        input_files = _handle_file_mode(config)
+    else:
+        _print_usage()
+        sys.exit(1)
+    
+    # Test mode (name filter without directory)
+    use_test_mode = config['validate'] or (config['directory'] and "test_cases" in config['directory'])
+    if use_test_mode and not config['directory']:
+        _run_test_suite(input_files, config['time_limit'], config['expected_only'],
+                        config['verbose'], config['parallel'], config['max_workers'])
+        return
+    
+    # Run mode
     if len(input_files) == 1:
         with open(input_files[0], "r") as f:
             data = json.load(f)
-        run_single_case(data, time_limit, os.path.basename(input_files[0]), strategies,
-                        validate=validate)
+        run_single_case(data, config['time_limit'], os.path.basename(input_files[0]),
+                       config['strategies'], config['validate'])
     else:
-        print(f"=== 批量执行 {len(input_files)} 个用例 ===")
-        print(f"时间限制: {time_limit}s/用例\n")
-
-        results = []
-        for i, filepath in enumerate(input_files, 1):
-            print(f"\n{'='*60}")
-            print(f"用例 {i}/{len(input_files)}: {os.path.basename(filepath)}")
-            print('='*60)
-
-            try:
-                with open(filepath, "r") as f:
-                    data = json.load(f)
-                result = run_single_case(data, time_limit, os.path.basename(filepath),
-                                         strategies, validate=validate)
-                results.append((os.path.basename(filepath), result))
-            except Exception as e:
-                print(f"❌ 执行失败: {e}")
-                results.append((os.path.basename(filepath), None))
-
-        print_run_summary(results)
+        _run_batch_cases(input_files, config)
 
 
 if __name__ == "__main__":
