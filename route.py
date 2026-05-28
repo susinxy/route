@@ -46,6 +46,12 @@ class Problem:
 
         self.nets: List[List[int]] = data.get("nets", [])
 
+        # numpy 数组版本，用于向量化计算
+        self.w_arr = np.array(self.widths, dtype=np.float64)
+        self.h_arr = np.array(self.heights, dtype=np.float64)
+        self.w_half = self.w_arr / 2.0
+        self.h_half = self.h_arr / 2.0
+
 
 # ============================================================
 # 线性表达式 & 约束化简系统
@@ -304,135 +310,133 @@ class ConstraintSystem:
 # 代价函数
 # ============================================================
 
-def compute_hpwl(problem: Problem, x: List[float], y: List[float]) -> float:
+def compute_hpwl(problem: Problem, x, y) -> float:
+    """向量化 HPWL 计算"""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    cx = x + problem.w_half
+    cy = y + problem.h_half
     total = 0.0
     for net in problem.nets:
         if len(net) < 2:
             continue
-        boxes = [b - 1 for b in net]
-        min_x = min(x[b] + problem.widths[b] / 2 for b in boxes)
-        max_x = max(x[b] + problem.widths[b] / 2 for b in boxes)
-        min_y = min(y[b] + problem.heights[b] / 2 for b in boxes)
-        max_y = max(y[b] + problem.heights[b] / 2 for b in boxes)
-        total += (max_x - min_x) + (max_y - min_y)
+        idx = np.array([b - 1 for b in net])
+        total += float(np.max(cx[idx]) - np.min(cx[idx]))
+        total += float(np.max(cy[idx]) - np.min(cy[idx]))
     return total
 
 
-def compute_area(problem: Problem, x: List[float], y: List[float]) -> float:
-    if not x:
+def compute_area(problem: Problem, x, y) -> float:
+    """向量化 Area 计算"""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if len(x) == 0:
         return 0.0
-    min_x = min(x)
-    min_y = min(y)
-    max_x = max(x[i] + problem.widths[i] for i in range(problem.n))
-    max_y = max(y[i] + problem.heights[i] for i in range(problem.n))
+    min_x = float(np.min(x))
+    min_y = float(np.min(y))
+    max_x = float(np.max(x + problem.w_arr))
+    max_y = float(np.max(y + problem.h_arr))
     return (max_x - min_x) * (max_y - min_y)
 
 
-def compute_overlap_penalty(problem: Problem, x: List[float], y: List[float],
-                             margin: float = 0.0) -> float:
+def compute_overlap_penalty(problem: Problem, x, y, margin: float = 0.0) -> float:
     """
-    计算重叠惩罚。margin > 0 时，每个 box 四边各扩 margin/2，
-    使 SA 在优化过程中主动保持间距，避免微小重叠。
+    向量化重叠惩罚。margin > 0 时，每个 box 四边各扩 margin/2。
+    用 numpy broadcasting 替代 O(n²) Python 双层循环。
     """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
     n = problem.n
-    half = margin / 2
-    total = 0.0
-    for i in range(n):
-        wi = problem.widths[i] + margin
-        hi = problem.heights[i] + margin
-        xi = x[i] - half
-        yi = y[i] - half
-        for j in range(i + 1, n):
-            wj = problem.widths[j] + margin
-            hj = problem.heights[j] + margin
-            xj = x[j] - half
-            yj = y[j] - half
-            ox = max(0, min(xi + wi, xj + wj) - max(xi, xj))
-            oy = max(0, min(yi + hi, yj + hj) - max(yi, yj))
-            total += ox * oy
-    return total
+    if n < 2:
+        return 0.0
+
+    half = margin / 2.0
+    w = problem.w_arr + margin
+    h = problem.h_arr + margin
+
+    xl = x - half
+    xr = xl + w
+    yl = y - half
+    yr = yl + h
+
+    # Broadcasting: (n,1) vs (1,n) → (n,n)
+    ox = np.maximum(0.0, np.minimum(xr[:, None], xr[None, :]) - np.maximum(xl[:, None], xl[None, :]))
+    oy = np.maximum(0.0, np.minimum(yr[:, None], yr[None, :]) - np.maximum(yl[:, None], yl[None, :]))
+    overlap_matrix = ox * oy
+
+    # 只求上三角（不含对角线），每对只算一次
+    return float(np.sum(overlap_matrix[np.triu_indices(n, k=1)]))
 
 
-def compute_proximity_penalty(problem: Problem, x: List[float], y: List[float],
+def compute_proximity_penalty(problem: Problem, x, y,
                                repeat_group_weight: float = 2.0,
                                net_weight: float = 0.5,
-                               align_weight: float = 1.5) -> float:
+                               align_weight: float = 1.5,
+                               group_size_power: float = 0.5) -> float:
     """
-    计算组内紧凑度惩罚：让组内 box 尽量聚在一起。
+    向量化组内紧凑度惩罚。
     
-    对每个 repeat group、net 和 align group，计算其内部所有 box 的 bounding box 面积。
-    面积越小 = 越紧凑。
-    
-    Args:
-        problem: 问题实例
-        x, y: box 坐标
-        repeat_group_weight: 重复组权重（中等优先级）
-        net_weight: net 权重（较小，避免和 HPWL 冲突）
-        align_weight: 对齐组权重（中等优先级）
-    
-    Returns:
-        总惩罚值
+    每个组的贡献按组规模缩放: weight * bbox_area * (n_members / 2) ^ group_size_power
+    组内 box 越多，惩罚越大，促使大组优先紧凑。
     """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    cx = x + problem.w_half
+    cy = y + problem.h_half
     total = 0.0
     
-    # 1. 重复组：每个 group 内部紧凑度
+    # 1. 重复组
     for rg in problem.repeat_groups:
         for group in rg:
-            boxes = [b - 1 for b in group]
-            if len(boxes) < 2:
+            idx = np.array([b - 1 for b in group])
+            if len(idx) < 2:
                 continue
-            # 计算 group 的 bounding box
-            min_x = min(x[b] + problem.widths[b] / 2 for b in boxes)
-            max_x = max(x[b] + problem.widths[b] / 2 for b in boxes)
-            min_y = min(y[b] + problem.heights[b] / 2 for b in boxes)
-            max_y = max(y[b] + problem.heights[b] / 2 for b in boxes)
-            bbox_area = (max_x - min_x) * (max_y - min_y)
-            total += repeat_group_weight * bbox_area
+            bbox_area = float((np.max(cx[idx]) - np.min(cx[idx])) *
+                             (np.max(cy[idx]) - np.min(cy[idx])))
+            size_factor = (len(idx) / 2.0) ** group_size_power
+            total += repeat_group_weight * bbox_area * size_factor
     
-    # 2. Net：每个 net 内部紧凑度
+    # 2. Net
     for net in problem.nets:
         if len(net) < 2:
             continue
-        boxes = [b - 1 for b in net]
-        min_x = min(x[b] + problem.widths[b] / 2 for b in boxes)
-        max_x = max(x[b] + problem.widths[b] / 2 for b in boxes)
-        min_y = min(y[b] + problem.heights[b] / 2 for b in boxes)
-        max_y = max(y[b] + problem.heights[b] / 2 for b in boxes)
-        bbox_area = (max_x - min_x) * (max_y - min_y)
-        total += net_weight * bbox_area
+        idx = np.array([b - 1 for b in net])
+        bbox_area = float((np.max(cx[idx]) - np.min(cx[idx])) *
+                         (np.max(cy[idx]) - np.min(cy[idx])))
+        size_factor = (len(idx) / 2.0) ** group_size_power
+        total += net_weight * bbox_area * size_factor
     
-    # 3. 对齐组：每个 align group 内部紧凑度
+    # 3. 对齐组
     all_align_groups = (
         problem.align_left + problem.align_right +
         problem.align_top + problem.align_bottom
     )
     for group in all_align_groups:
-        boxes = [b - 1 for b in group]
-        if len(boxes) < 2:
+        idx = np.array([b - 1 for b in group])
+        if len(idx) < 2:
             continue
-        min_x = min(x[b] + problem.widths[b] / 2 for b in boxes)
-        max_x = max(x[b] + problem.widths[b] / 2 for b in boxes)
-        min_y = min(y[b] + problem.heights[b] / 2 for b in boxes)
-        max_y = max(y[b] + problem.heights[b] / 2 for b in boxes)
-        bbox_area = (max_x - min_x) * (max_y - min_y)
-        total += align_weight * bbox_area
+        bbox_area = float((np.max(cx[idx]) - np.min(cx[idx])) *
+                         (np.max(cy[idx]) - np.min(cy[idx])))
+        size_factor = (len(idx) / 2.0) ** group_size_power
+        total += align_weight * bbox_area * size_factor
     
     return total
 
 
-def compute_cost(problem: Problem, x: List[float], y: List[float],
+def compute_cost(problem: Problem, x, y,
                  overlap_lambda: float = 0.0,
                  margin: float = 0.0,
-                 proximity_weight: float = 0.0) -> Tuple[float, float, float, float]:
+                 proximity_weight: float = 0.0,
+                 group_size_power: float = 0.5) -> Tuple[float, float, float, float]:
     """返回 (total_cost, hpwl, area, overlap)"""
     hpwl = compute_hpwl(problem, x, y)
     area = compute_area(problem, x, y)
     overlap = compute_overlap_penalty(problem, x, y, margin=margin)
     total = 10 * hpwl + area + overlap_lambda * overlap
     
-    # proximity 只在 proximity_weight > 0 时参与优化
     if proximity_weight > 0:
-        proximity = compute_proximity_penalty(problem, x, y)
+        proximity = compute_proximity_penalty(problem, x, y,
+                                               group_size_power=group_size_power)
         total += proximity_weight * proximity
     
     return total, hpwl, area, overlap
@@ -491,19 +495,21 @@ class SimulatedAnnealing:
                 if fv in fv_idx:
                     self.y_coeffs[i, fv_idx[fv]] = c
 
-    def _decode_fast(self, var_array: np.ndarray) -> Tuple[List[float], List[float]]:
-        """快速解码: 矩阵运算"""
+
+
+    def _decode_fast(self, var_array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """快速解码: 矩阵运算，返回 numpy 数组"""
         x = self.x_coeffs @ var_array + self.x_const
         y = self.y_coeffs @ var_array + self.y_const
-        return x.tolist(), y.tolist()
+        return x, y
 
-    def _compute_layout_scale(self, x: List[float], y: List[float]) -> float:
+    def _compute_layout_scale(self, x, y) -> float:
         """计算布局尺度，用于自适应扰动"""
-        if not x:
+        if len(x) == 0:
             return 1.0
-        x_range = max(x) - min(x) + max(self.problem.widths)
-        y_range = max(y) - min(y) + max(self.problem.heights)
-        return max(x_range, y_range, 1.0)
+        x_range = float(np.max(x) - np.min(x)) + np.max(self.problem.w_arr)
+        y_range = float(np.max(y) - np.min(y)) + np.max(self.problem.h_arr)
+        return float(max(x_range, y_range, 1.0))
 
     def _fit_to_target(self, target_x: List[float], target_y: List[float]) -> np.ndarray:
         """将目标坐标映射到约束空间的自由变量值"""
@@ -825,7 +831,10 @@ class SimulatedAnnealing:
               f"best_cost={self.best_cost:.2f}, overlap={self.best_overlap:.2f}, "
               f"time={elapsed:.1f}s")
 
-        return self.best_x, self.best_y, self.best_cost
+        # 返回 list 格式以保持接口兼容
+        bx = self.best_x.tolist() if isinstance(self.best_x, np.ndarray) else list(self.best_x)
+        by = self.best_y.tolist() if isinstance(self.best_y, np.ndarray) else list(self.best_y)
+        return bx, by, self.best_cost
 
     def _run_round(self, init_fn, time_budget, round_num):
         local_t0 = time.time()
@@ -853,43 +862,53 @@ class SimulatedAnnealing:
 
             progress = (time.time() - local_t0) / time_budget
             if current_overlap_m > 0.01:
-                # 更强的重叠惩罚（含 margin），迫使快速消除重叠并保持间距
                 overlap_lambda = 50000.0 * (1 + progress * 100)
                 area_lambda = 0.0
             else:
                 overlap_lambda = 0.0
-                # Area penalty: increase over time, especially in deep optimization
-                # Phase 1 (0-0.3): no area penalty, focus on HPWL
-                # Phase 2 (0.3-1.0): gradually increase area penalty
                 if progress < 0.3:
                     area_lambda = 0.0
                 else:
-                    area_lambda = 0.5 + (progress - 0.3) * 1.0  # 0.5 -> 1.2
+                    area_lambda = 0.5 + (progress - 0.3) * 1.0
 
             new_arr = self._perturb(current_arr, temperature, max_temp, layout_scale)
             new_x, new_y = self._decode_fast(new_arr)
-            # 用 margin 版 overlap + proximity 做 SA 引导
-            # 基于规模的自适应策略
+
+            # 基于规模的自适应 proximity 权重（5档 + 组规模缩放）
             n_boxes = self.problem.n
             if n_boxes <= 15:
-                # 小规模：禁用 proximity，让基础 cost 主导
+                # 小规模：禁用，基础 cost 足够
                 proximity_w = 0.0
+                group_size_power = 0.0
             elif n_boxes <= 24:
-                # 中规模：弱权重，避免过度约束
+                # 中小规模：弱引导
                 proximity_w = 0.5
+                group_size_power = 0.3
+            elif n_boxes <= 40:
+                # 中大规模：中等引导，逐渐衰减
+                proximity_w = 1.0 - 0.5 * progress
+                group_size_power = 0.5
+            elif n_boxes <= 70:
+                # 大规模：强引导
+                proximity_w = 2.0 - 1.0 * progress
+                group_size_power = 0.7
             else:
-                # 大规模：强权重，前期 2.0 → 后期 0.5
-                proximity_w = 2.0 - 1.5 * progress
+                # 超大规模：最强引导
+                proximity_w = 3.0 - 1.5 * progress
+                group_size_power = 1.0
+
             new_total, new_hpwl, new_area, new_overlap_m = \
                 compute_cost(self.problem, new_x, new_y, overlap_lambda,
-                             margin=OVERLAP_MARGIN, proximity_weight=proximity_w)
-            # 同时算真实 overlap 用于报告
+                             margin=OVERLAP_MARGIN, proximity_weight=proximity_w,
+                             group_size_power=group_size_power)
             new_real_overlap = compute_overlap_penalty(self.problem, new_x, new_y)
             new_real_cost = 10 * new_hpwl + new_area + area_lambda * new_area
 
             current_total = current_real_cost + overlap_lambda * current_overlap_m
             if proximity_w > 0:
-                current_total += proximity_w * compute_proximity_penalty(self.problem, current_x, current_y)
+                current_total += proximity_w * compute_proximity_penalty(
+                    self.problem, current_x, current_y,
+                    group_size_power=group_size_power)
             delta = new_total - current_total
 
             accept = False
@@ -935,14 +954,14 @@ class SimulatedAnnealing:
                 self.best_cost = real_cost
                 self.best_values = {fv: float(var_arr[j])
                                    for j, fv in enumerate(self.free_vars)}
-                self.best_x = x.copy()
-                self.best_y = y.copy()
+                self.best_x = np.array(x)
+                self.best_y = np.array(y)
                 self.best_overlap = overlap
         elif self.best_overlap >= 0.001 and overlap < self.best_overlap:
             self.best_values = {fv: float(var_arr[j])
                                for j, fv in enumerate(self.free_vars)}
-            self.best_x = x.copy()
-            self.best_y = y.copy()
+            self.best_x = np.array(x)
+            self.best_y = np.array(y)
             self.best_overlap = overlap
             self.best_cost = real_cost
 
@@ -952,8 +971,8 @@ class SimulatedAnnealing:
         ratio = temperature / max_temp
 
         # Use median box size as perturbation unit
-        all_dims = self.problem.widths + self.problem.heights
-        box_scale = sorted(all_dims)[len(all_dims) // 2]
+        all_dims = np.concatenate([self.problem.w_arr, self.problem.h_arr])
+        box_scale = float(np.median(all_dims))
 
         r = random.random()
         if r < 0.15 and self.best_overlap < 0.001:
@@ -963,10 +982,7 @@ class SimulatedAnnealing:
             new_vars = center + (new_vars - center) * factor
         elif r < 0.25:
             # Area-focused move: shrink boundary boxes toward center
-            if self.best_x:
-                x, y = self._decode_fast(new_vars)
-                cx = (min(x) + max(x)) / 2
-                cy = (min(y) + max(y)) / 2
+            if len(self.best_x) > 0:
                 factor = 1.0 - random.uniform(0.01, 0.05)
                 new_vars = new_vars * factor + (1 - factor) * np.mean(new_vars)
         else:
@@ -995,12 +1011,14 @@ class SimulatedAnnealing:
 # ============================================================
 
 def _postprocess(problem: Problem, cs: ConstraintSystem,
-                 x_coords: List[float], y_coords: List[float],
-                 remaining_time: float = 10.0) -> Tuple[List[float], List[float]]:
+                 x_coords, y_coords,
+                 remaining_time: float = 10.0):
     """后处理:在约束满足前提下微调消除残余重叠"""
     n = problem.n
     free_vars = sorted(cs.free_vars)
     num_vars = len(free_vars)
+    x_coords = np.asarray(x_coords, dtype=np.float64)
+    y_coords = np.asarray(y_coords, dtype=np.float64)
 
     A = np.zeros((2 * n, num_vars))
     b = np.zeros(2 * n)
@@ -1019,7 +1037,6 @@ def _postprocess(problem: Problem, cs: ConstraintSystem,
     current_values = {fv: float(result[j]) for j, fv in enumerate(free_vars)}
 
     best_values = current_values.copy()
-    # 用 margin 版 overlap 做引导，让后处理也主动保持间距
     best_overlap_m = compute_overlap_penalty(problem, x_coords, y_coords,
                                               margin=OVERLAP_MARGIN)
     best_real_overlap = compute_overlap_penalty(problem, x_coords, y_coords)
@@ -1027,7 +1044,7 @@ def _postprocess(problem: Problem, cs: ConstraintSystem,
     best_y = y_coords.copy()
 
     t0 = time.time()
-    max_dim = max(max(problem.widths), max(problem.heights))
+    max_dim = max(float(np.max(problem.w_arr)), float(np.max(problem.h_arr)))
     step = max_dim * 0.5
 
     for iteration in range(10000):
@@ -1046,24 +1063,26 @@ def _postprocess(problem: Problem, cs: ConstraintSystem,
             best_overlap_m = new_overlap_m
             best_real_overlap = new_real_overlap
             best_values = new_values.copy()
-            best_x = new_x.copy()
-            best_y = new_y.copy()
+            best_x = np.array(new_x)
+            best_y = np.array(new_y)
             current_values = new_values
             if new_real_overlap < 0.001:
                 break
         step *= 0.999
 
-    return best_x, best_y
+    return best_x.tolist(), best_y.tolist()
 
 
 def _compress_layout(problem: Problem, cs: ConstraintSystem, 
-                     x_coords: List[float], y_coords: List[float],
-                     remaining_time: float = 5.0) -> Tuple[List[float], List[float]]:
+                     x_coords, y_coords,
+                     remaining_time: float = 5.0):
     """
     全局压缩后处理：仅在能改善总成本时应用
     """
     free_vars = sorted(cs.free_vars)
     num_vars = len(free_vars)
+    x_coords = np.asarray(x_coords, dtype=np.float64)
+    y_coords = np.asarray(y_coords, dtype=np.float64)
 
     # 将当前坐标映射回自由变量
     A = np.zeros((2 * problem.n, num_vars))
@@ -1099,7 +1118,6 @@ def _compress_layout(problem: Problem, cs: ConstraintSystem,
         improved = False
         iteration += 1
         
-        # 尝试多种缩放比例
         scales_x = [0.99, 0.98, 0.97, 0.96, 0.95, 1.00, 1.01, 1.02]
         scales_y = [0.99, 0.98, 0.97, 0.96, 0.95, 1.00, 1.01, 1.02]
         
@@ -1113,9 +1131,7 @@ def _compress_layout(problem: Problem, cs: ConstraintSystem,
                 if time.time() - t0 > remaining_time * 0.85:
                     break
                 
-                # 分别缩放x和y方向的变量
                 new_arr = current_arr.copy()
-                # 简化：统一缩放（因为变量混合了x和y）
                 scale = (sx + sy) / 2.0
                 centroid = np.mean(current_arr)
                 new_arr = centroid + (current_arr - centroid) * scale
@@ -1123,20 +1139,17 @@ def _compress_layout(problem: Problem, cs: ConstraintSystem,
                 new_x, new_y = cs.decode(
                     {fv: float(new_arr[j]) for j, fv in enumerate(free_vars)})
                 
-                # 检查重叠
                 overlap = compute_overlap_penalty(problem, new_x, new_y)
-                if overlap > 15.0:  # 允许少量重叠
+                if overlap > 15.0:
                     continue
                 
                 _, new_hpwl, new_area, new_overlap = compute_cost(problem, new_x, new_y)
                 new_cost = 10 * new_hpwl + new_area
                 
-                # 如果改善超过0.5%，记录下来
                 if new_cost < best_scale_cost * 0.995:
                     best_scale_cost = new_cost
                     best_scale_combo = (sx, sy)
         
-        # 应用最佳缩放
         if best_scale_combo is not None:
             sx, sy = best_scale_combo
             scale = (sx + sy) / 2.0
@@ -1155,7 +1168,9 @@ def _compress_layout(problem: Problem, cs: ConstraintSystem,
                   f"overlap={new_overlap:.2f}")
     
     print(f"    压缩后: cost={best_cost:.1f}, 改善={100*(1-best_cost/(10*hpwl0+area0)):.1f}%")
-    return best_x, best_y
+    bx = best_x.tolist() if isinstance(best_x, np.ndarray) else list(best_x)
+    by = best_y.tolist() if isinstance(best_y, np.ndarray) else list(best_y)
+    return bx, by
 
 
 # ============================================================
