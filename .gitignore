@@ -1,3 +1,17 @@
 __pycache__/
 *.pyc
 output.json
+
+# 算法结果缓存（本地生成，不提交）
+cache/
+
+# 可视化输出（本地生成，不提交）
+visualizations/
+visualizations_new/
+visualizations_test/
+viz_test/
+
+# 临时输出
+output_*.json
+*_viz_test.png
+viz_*.png
