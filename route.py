@@ -353,14 +353,88 @@ def compute_overlap_penalty(problem: Problem, x: List[float], y: List[float],
     return total
 
 
+def compute_proximity_penalty(problem: Problem, x: List[float], y: List[float],
+                               repeat_group_weight: float = 2.0,
+                               net_weight: float = 0.5,
+                               align_weight: float = 1.5) -> float:
+    """
+    计算组内紧凑度惩罚：让组内 box 尽量聚在一起。
+    
+    对每个 repeat group、net 和 align group，计算其内部所有 box 的 bounding box 面积。
+    面积越小 = 越紧凑。
+    
+    Args:
+        problem: 问题实例
+        x, y: box 坐标
+        repeat_group_weight: 重复组权重（中等优先级）
+        net_weight: net 权重（较小，避免和 HPWL 冲突）
+        align_weight: 对齐组权重（中等优先级）
+    
+    Returns:
+        总惩罚值
+    """
+    total = 0.0
+    
+    # 1. 重复组：每个 group 内部紧凑度
+    for rg in problem.repeat_groups:
+        for group in rg:
+            boxes = [b - 1 for b in group]
+            if len(boxes) < 2:
+                continue
+            # 计算 group 的 bounding box
+            min_x = min(x[b] + problem.widths[b] / 2 for b in boxes)
+            max_x = max(x[b] + problem.widths[b] / 2 for b in boxes)
+            min_y = min(y[b] + problem.heights[b] / 2 for b in boxes)
+            max_y = max(y[b] + problem.heights[b] / 2 for b in boxes)
+            bbox_area = (max_x - min_x) * (max_y - min_y)
+            total += repeat_group_weight * bbox_area
+    
+    # 2. Net：每个 net 内部紧凑度
+    for net in problem.nets:
+        if len(net) < 2:
+            continue
+        boxes = [b - 1 for b in net]
+        min_x = min(x[b] + problem.widths[b] / 2 for b in boxes)
+        max_x = max(x[b] + problem.widths[b] / 2 for b in boxes)
+        min_y = min(y[b] + problem.heights[b] / 2 for b in boxes)
+        max_y = max(y[b] + problem.heights[b] / 2 for b in boxes)
+        bbox_area = (max_x - min_x) * (max_y - min_y)
+        total += net_weight * bbox_area
+    
+    # 3. 对齐组：每个 align group 内部紧凑度
+    all_align_groups = (
+        problem.align_left + problem.align_right +
+        problem.align_top + problem.align_bottom
+    )
+    for group in all_align_groups:
+        boxes = [b - 1 for b in group]
+        if len(boxes) < 2:
+            continue
+        min_x = min(x[b] + problem.widths[b] / 2 for b in boxes)
+        max_x = max(x[b] + problem.widths[b] / 2 for b in boxes)
+        min_y = min(y[b] + problem.heights[b] / 2 for b in boxes)
+        max_y = max(y[b] + problem.heights[b] / 2 for b in boxes)
+        bbox_area = (max_x - min_x) * (max_y - min_y)
+        total += align_weight * bbox_area
+    
+    return total
+
+
 def compute_cost(problem: Problem, x: List[float], y: List[float],
                  overlap_lambda: float = 0.0,
-                 margin: float = 0.0) -> Tuple[float, float, float, float]:
+                 margin: float = 0.0,
+                 proximity_weight: float = 0.0) -> Tuple[float, float, float, float]:
     """返回 (total_cost, hpwl, area, overlap)"""
     hpwl = compute_hpwl(problem, x, y)
     area = compute_area(problem, x, y)
     overlap = compute_overlap_penalty(problem, x, y, margin=margin)
     total = 10 * hpwl + area + overlap_lambda * overlap
+    
+    # proximity 只在 proximity_weight > 0 时参与优化
+    if proximity_weight > 0:
+        proximity = compute_proximity_penalty(problem, x, y)
+        total += proximity_weight * proximity
+    
     return total, hpwl, area, overlap
 
 
@@ -794,15 +868,28 @@ class SimulatedAnnealing:
 
             new_arr = self._perturb(current_arr, temperature, max_temp, layout_scale)
             new_x, new_y = self._decode_fast(new_arr)
-            # 用 margin 版 overlap 做 SA 引导
+            # 用 margin 版 overlap + proximity 做 SA 引导
+            # 基于规模的自适应策略
+            n_boxes = self.problem.n
+            if n_boxes <= 15:
+                # 小规模：禁用 proximity，让基础 cost 主导
+                proximity_w = 0.0
+            elif n_boxes <= 24:
+                # 中规模：弱权重，避免过度约束
+                proximity_w = 0.5
+            else:
+                # 大规模：强权重，前期 2.0 → 后期 0.5
+                proximity_w = 2.0 - 1.5 * progress
             new_total, new_hpwl, new_area, new_overlap_m = \
                 compute_cost(self.problem, new_x, new_y, overlap_lambda,
-                             margin=OVERLAP_MARGIN)
+                             margin=OVERLAP_MARGIN, proximity_weight=proximity_w)
             # 同时算真实 overlap 用于报告
             new_real_overlap = compute_overlap_penalty(self.problem, new_x, new_y)
             new_real_cost = 10 * new_hpwl + new_area + area_lambda * new_area
 
             current_total = current_real_cost + overlap_lambda * current_overlap_m
+            if proximity_w > 0:
+                current_total += proximity_w * compute_proximity_penalty(self.problem, current_x, current_y)
             delta = new_total - current_total
 
             accept = False
