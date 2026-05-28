@@ -44,6 +44,30 @@ from route import (Problem, ConstraintSystem, SimulatedAnnealing,
                    compute_overlap_penalty)
 
 
+def solve_and_report(problem: Problem, time_limit: float = 115.0,
+                     strategies: List[str] = None) -> Dict[str, Any]:
+    """
+    调用 solve() 并计算成本报告。
+    solve() 返回原始坐标, 这里负责组装最终结果字典。
+    """
+    x_coords, y_coords, elapsed = solve(problem, time_limit=time_limit,
+                                        strategies=strategies)
+    _, hpwl, area, overlap = compute_cost(problem, x_coords, y_coords)
+    real_cost = 10 * hpwl + area
+
+    box_position = [[round(x_coords[i], 4), round(y_coords[i], 4)]
+                    for i in range(problem.n)]
+
+    return {
+        "box_position": box_position,
+        "cost": round(real_cost, 4),
+        "hpwl": round(hpwl, 4),
+        "area": round(area, 4),
+        "overlap": round(overlap, 4),
+        "elapsed_seconds": round(elapsed, 2),
+    }
+
+
 # ============================================================
 # 约束验证器 (从 route.py 移出)
 # ============================================================
@@ -418,7 +442,7 @@ def run_single_case(data: Dict[str, Any], time_limit: float, case_name: str,
     print()
 
     problem = Problem(input_data)
-    result = solve(problem, time_limit=time_limit, strategies=strategies)
+    result = solve_and_report(problem, time_limit=time_limit, strategies=strategies)
 
     print(f"\n=== 结果 ===")
     print(f"Cost:    {result['cost']}")
@@ -488,9 +512,8 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
 
     # --- 2. 运行算法 ---
     problem = Problem(input_data)
-    t0 = time.time()
-    solve_result = solve(problem, time_limit=time_limit)
-    elapsed = time.time() - t0
+    solve_result = solve_and_report(problem, time_limit=time_limit)
+    elapsed = solve_result["elapsed_seconds"]
 
     algo_positions = solve_result["box_position"]
     algo_result = verify_all_constraints(

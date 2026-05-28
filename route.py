@@ -1111,17 +1111,4 @@ def solve(problem: Problem, time_limit: float = 115.0,
                                               remaining_time=remaining)
 
     elapsed = time.time() - t0
-    _, hpwl, area, overlap = compute_cost(problem, x_coords, y_coords)
-    real_cost = 10 * hpwl + area
-
-    box_position = [[round(x_coords[i], 4), round(y_coords[i], 4)]
-                    for i in range(problem.n)]
-
-    return {
-        "box_position": box_position,
-        "cost": round(real_cost, 4),
-        "hpwl": round(hpwl, 4),
-        "area": round(area, 4),
-        "overlap": round(overlap, 4),
-        "elapsed_seconds": round(elapsed, 2),
-    }
+    return x_coords, y_coords, elapsed
