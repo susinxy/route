@@ -38,6 +38,23 @@ import time
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.patches import Rectangle, FancyArrowPatch
+import matplotlib.font_manager as fm
+import numpy as np
+
+# 配置中文字体 - 直接使用字体文件路径
+_ZH_FONT_PATH = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
+if os.path.exists(_ZH_FONT_PATH):
+    fm.fontManager.addfont(_ZH_FONT_PATH)
+    _zh_font_prop = fm.FontProperties(fname=_ZH_FONT_PATH)
+    plt.rcParams['font.sans-serif'] = [_zh_font_prop.get_name()]
+else:
+    plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -166,6 +183,547 @@ def validate_input(data: Dict[str, Any], eps: float = 1e-6):
     _check_repeat_groups(data, widths, heights, n, eps)
     _check_alignment_constraints(data, n)
     _check_network_constraints(data, n)
+
+
+# ============================================================
+# 可视化
+# ============================================================
+
+# 颜色方案
+_COLORS = {
+    'sym_x': '#FF6B6B',      # 红
+    'sym_y': '#4ECDC4',      # 青
+    'align': '#45B7D1',      # 蓝
+    'repeat': '#96CEB4',     # 绿
+    'default': '#D4A574',    # 棕
+    'net': '#FF8C42',        # 橙
+    'self_sym': '#FFEAA7',   # 黄
+}
+
+
+def _get_box_colors(data: Dict[str, Any]) -> Dict[int, str]:
+    """根据约束类型为每个box分配颜色"""
+    n = len(data["box_size"])
+    colors = {i: _COLORS['default'] for i in range(n)}
+
+    # 对称组着色（优先级高）
+    for group in data.get("symmetry_x", []):
+        for pair in group.get("symmetry_pair", []):
+            colors[pair[0] - 1] = _COLORS['sym_x']
+            colors[pair[1] - 1] = _COLORS['sym_x']
+        for s in group.get("self_symmetry", []):
+            colors[s - 1] = _COLORS['self_sym']
+
+    for group in data.get("symmetry_y", []):
+        for pair in group.get("symmetry_pair", []):
+            colors[pair[0] - 1] = _COLORS['sym_y']
+            colors[pair[1] - 1] = _COLORS['sym_y']
+        for s in group.get("self_symmetry", []):
+            colors[s - 1] = _COLORS['self_sym']
+
+    # 重复组着色
+    for rg in data.get("repeat_groups", []):
+        for group in rg.get("groups", []):
+            for box_id in group:
+                colors[box_id - 1] = _COLORS['repeat']
+
+    return colors
+
+
+def _draw_boxes(ax, data: Dict[str, Any], positions: List[List[float]],
+                title: str, show_ids: bool = True):
+    """在ax上绘制布局"""
+    widths = [s[0] for s in data["box_size"]]
+    heights = [s[1] for s in data["box_size"]]
+    n = len(widths)
+    colors = _get_box_colors(data)
+
+    for i in range(n):
+        x, y = positions[i][0], positions[i][1]
+        w, h = widths[i], heights[i]
+        color = colors[i]
+
+        rect = patches.Rectangle((x, y), w, h,
+                                  linewidth=1.5, edgecolor='#333',
+                                  facecolor=color, alpha=0.7)
+        ax.add_patch(rect)
+
+        if show_ids:
+            cx = x + w / 2
+            cy = y + h / 2
+            fontsize = max(6, min(10, min(w, h) * 0.8))
+            ax.text(cx, cy, str(i + 1),
+                    ha='center', va='center',
+                    fontsize=fontsize, fontweight='bold', color='#333')
+
+    # 计算边界
+    if positions:
+        min_x = min(p[0] for p in positions)
+        min_y = min(p[1] for p in positions)
+        max_x = max(positions[i][0] + widths[i] for i in range(n))
+        max_y = max(positions[i][1] + heights[i] for i in range(n))
+        pad_x = (max_x - min_x) * 0.1 + 2
+        pad_y = (max_y - min_y) * 0.1 + 2
+        ax.set_xlim(min_x - pad_x, max_x + pad_x)
+        ax.set_ylim(min_y - pad_y, max_y + pad_y)
+
+    ax.set_aspect('equal')
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+
+
+
+# ---- 约束组提取 ----
+
+def _extract_constraint_groups(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    将输入约束拆分为独立的组，每组一个 dict:
+    {
+      "type": "sym_x" | "sym_y" | "repeat" | "align" | "net",
+      "label": str,        # 子图标题
+      "color": str,        # 主色
+      "box_ids": [int],    # 1-based box IDs
+      "sub_groups": {...}, # 内部子结构
+    }
+    """
+    groups = []
+
+    # X 对称
+    for gi, g in enumerate(data.get("symmetry_x", [])):
+        pairs = g.get("symmetry_pair", [])
+        selfs = g.get("self_symmetry", [])
+        ids = set()
+        for p in pairs:
+            ids.update(p)
+        ids.update(selfs)
+        groups.append({
+            "type": "sym_x", "label": f"X对称组{gi}",
+            "color": _COLORS['sym_x'],
+            "box_ids": sorted(ids),
+            "sub_groups": {"pairs": pairs, "selfs": selfs},
+        })
+
+    # Y 对称
+    for gi, g in enumerate(data.get("symmetry_y", [])):
+        pairs = g.get("symmetry_pair", [])
+        selfs = g.get("self_symmetry", [])
+        ids = set()
+        for p in pairs:
+            ids.update(p)
+        ids.update(selfs)
+        groups.append({
+            "type": "sym_y", "label": f"Y对称组{gi}",
+            "color": _COLORS['sym_y'],
+            "box_ids": sorted(ids),
+            "sub_groups": {"pairs": pairs, "selfs": selfs},
+        })
+
+    # 重复组
+    for ri, rg in enumerate(data.get("repeat_groups", [])):
+        all_ids = []
+        for grp in rg.get("groups", []):
+            all_ids.extend(grp)
+        groups.append({
+            "type": "repeat", "label": f"重复组{ri}",
+            "color": _COLORS['repeat'],
+            "box_ids": sorted(set(all_ids)),
+            "sub_groups": {"groups": rg.get("groups", [])},
+        })
+
+    # 对齐
+    align = data.get("align", {})
+    for direction in ["left", "right", "top", "bottom"]:
+        for ai, grp in enumerate(align.get(direction, [])):
+            if not grp:
+                continue
+            groups.append({
+                "type": "align", "label": f"对齐-{direction}[{ai}]",
+                "color": _COLORS['align'],
+                "box_ids": sorted(grp),
+                "sub_groups": {"direction": direction, "group": grp},
+            })
+
+    # 网络
+    nets = data.get("nets", [])
+    for ni, net in enumerate(nets):
+        groups.append({
+            "type": "net", "label": f"Net{ni}",
+            "color": _COLORS['net'],
+            "box_ids": sorted(net),
+            "sub_groups": {"net": net},
+        })
+
+    return groups
+
+
+# ---- 单个约束组子图绘制 ----
+
+def _draw_constraint_group_panel(ax, group: Dict[str, Any],
+                                  widths: List[float], heights: List[float]):
+    """在单个 ax 上绘制一个约束组：box 缩略图 + 关系连线"""
+    box_ids = group["box_ids"]  # 1-based
+    color = group["color"]
+    gtype = group["type"]
+    n = len(box_ids)
+    if n == 0:
+        ax.axis('off')
+        return
+
+    # 布局：紧凑网格
+    cols = max(2, int(np.ceil(np.sqrt(n))))
+    cell_w = 28
+    cell_h = 22
+    positions = {}
+    for idx, bid in enumerate(box_ids):
+        row = idx // cols
+        col = idx % cols
+        cx = col * cell_w + cell_w / 2
+        cy = -(row * cell_h) - cell_h / 2
+        positions[bid] = (cx, cy)
+
+    # 绘制 box 缩略块
+    max_dim = max(max(widths), max(heights)) if widths else 1
+    scale = 12.0 / max_dim if max_dim > 0 else 1.0
+    for bid in box_ids:
+        cx, cy = positions[bid]
+        w = widths[bid - 1] * scale
+        h = heights[bid - 1] * scale
+        rect = patches.FancyBboxPatch(
+            (cx - w/2, cy - h/2), w, h,
+            boxstyle="round,pad=0.5",
+            linewidth=1.5, edgecolor='#444',
+            facecolor=color, alpha=0.75)
+        ax.add_patch(rect)
+        ax.text(cx, cy, str(bid), ha='center', va='center',
+                fontsize=8, fontweight='bold', color='white')
+        ax.text(cx, cy - h/2 - 1.5, f"{widths[bid-1]:.0f}×{heights[bid-1]:.0f}",
+                ha='center', va='top', fontsize=5.5, color='#666')
+
+    sub = group["sub_groups"]
+
+    if gtype in ("sym_x", "sym_y"):
+        pairs = sub.get("pairs", [])
+        selfs = sub.get("selfs", [])
+        axis_label = "X轴" if gtype == "sym_x" else "Y轴"
+        for pair in pairs:
+            if pair[0] in positions and pair[1] in positions:
+                x1, y1 = positions[pair[0]]
+                x2, y2 = positions[pair[1]]
+                rad = 0.3 if gtype == "sym_x" else -0.3
+                ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                            arrowprops=dict(arrowstyle='<->', color=color,
+                                            lw=1.8, connectionstyle=f'arc3,rad={rad}'))
+                mx, my = (x1+x2)/2, (y1+y2)/2
+                offset = 2.5 if gtype == "sym_x" else -2.5
+                ax.text(mx, my + offset, '⇔', fontsize=8, color=color,
+                        ha='center', fontweight='bold')
+        for s in selfs:
+            if s in positions:
+                cx, cy = positions[s]
+                ax.plot([cx, cx], [cy + 6, cy - 6], color=color, lw=2,
+                        linestyle='--', alpha=0.7)
+                ax.text(cx + 3, cy + 6, f"自{axis_label}", fontsize=5.5,
+                        color=color, fontweight='bold')
+
+    elif gtype == "repeat":
+        grp_lists = sub.get("groups", [])
+        group_colors = ['#E17055', '#00B894', '#6C5CE7', '#FDCB6E']
+        for gi, grp in enumerate(grp_lists):
+            gc = group_colors[gi % len(group_colors)]
+            grp_positions = [positions[bid] for bid in grp if bid in positions]
+            if grp_positions:
+                min_x = min(p[0] for p in grp_positions) - cell_w * 0.45
+                max_x = max(p[0] for p in grp_positions) + cell_w * 0.45
+                min_y = min(p[1] for p in grp_positions) - cell_h * 0.45
+                max_y = max(p[1] for p in grp_positions) + cell_h * 0.45
+                rect = patches.Rectangle(
+                    (min_x, min_y), max_x - min_x, max_y - min_y,
+                    linewidth=2, edgecolor=gc, facecolor=gc, alpha=0.08,
+                    linestyle='--')
+                ax.add_patch(rect)
+                ax.text(min_x + 1, max_y - 0.5, f"G{gi}", fontsize=6,
+                        color=gc, fontweight='bold')
+            for k in range(len(grp) - 1):
+                if grp[k] in positions and grp[k+1] in positions:
+                    x1, y1 = positions[grp[k]]
+                    x2, y2 = positions[grp[k+1]]
+                    ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                                arrowprops=dict(arrowstyle='-', color=gc,
+                                                lw=1.5, connectionstyle='arc3,rad=0'))
+        if len(grp_lists) >= 2:
+            for gi in range(1, len(grp_lists)):
+                ref = grp_lists[0]
+                grp = grp_lists[gi]
+                for k in range(min(len(ref), len(grp))):
+                    if ref[k] in positions and grp[k] in positions:
+                        x1, y1 = positions[ref[k]]
+                        x2, y2 = positions[grp[k]]
+                        ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                                    arrowprops=dict(arrowstyle='->', color='#999',
+                                                    lw=1, linestyle='dotted',
+                                                    connectionstyle='arc3,rad=0.2'))
+
+    elif gtype == "align":
+        direction = sub.get("direction", "")
+        grp = sub.get("group", [])
+        grp_positions = [positions[bid] for bid in grp if bid in positions]
+        if len(grp_positions) >= 2:
+            if direction == "left":
+                line_x = min(p[0] for p in grp_positions) - 5
+                ys = [p[1] for p in grp_positions]
+                ax.plot([line_x, line_x], [min(ys) - 5, max(ys) + 5],
+                        color=color, lw=2.5, alpha=0.8)
+                # 箭头：竖线 + 右向短横
+                for yy in [min(ys) - 5, max(ys) + 5]:
+                    ax.annotate('', xy=(line_x + 3, yy), xytext=(line_x, yy),
+                                arrowprops=dict(arrowstyle='->', color=color, lw=1.5))
+                ax.text(line_x - 1, max(ys) + 8, 'left', fontsize=6,
+                        color=color, ha='center', fontweight='bold')
+            elif direction == "right":
+                line_x = max(p[0] for p in grp_positions) + 5
+                ys = [p[1] for p in grp_positions]
+                ax.plot([line_x, line_x], [min(ys) - 5, max(ys) + 5],
+                        color=color, lw=2.5, alpha=0.8)
+                for yy in [min(ys) - 5, max(ys) + 5]:
+                    ax.annotate('', xy=(line_x - 3, yy), xytext=(line_x, yy),
+                                arrowprops=dict(arrowstyle='->', color=color, lw=1.5))
+                ax.text(line_x + 1, max(ys) + 8, 'right', fontsize=6,
+                        color=color, ha='center', fontweight='bold')
+            elif direction == "top":
+                line_y = max(p[1] for p in grp_positions) + 5
+                xs = [p[0] for p in grp_positions]
+                ax.plot([min(xs) - 5, max(xs) + 5], [line_y, line_y],
+                        color=color, lw=2.5, alpha=0.8)
+                for xx in [min(xs) - 5, max(xs) + 5]:
+                    ax.annotate('', xy=(xx, line_y - 3), xytext=(xx, line_y),
+                                arrowprops=dict(arrowstyle='->', color=color, lw=1.5))
+                ax.text(max(xs) + 8, line_y, 'top', fontsize=6,
+                        color=color, ha='left', va='center', fontweight='bold')
+            elif direction == "bottom":
+                line_y = min(p[1] for p in grp_positions) - 5
+                xs = [p[0] for p in grp_positions]
+                ax.plot([min(xs) - 5, max(xs) + 5], [line_y, line_y],
+                        color=color, lw=2.5, alpha=0.8)
+                for xx in [min(xs) - 5, max(xs) + 5]:
+                    ax.annotate('', xy=(xx, line_y + 3), xytext=(xx, line_y),
+                                arrowprops=dict(arrowstyle='->', color=color, lw=1.5))
+                ax.text(max(xs) + 8, line_y, 'bottom', fontsize=6,
+                        color=color, ha='left', va='center', fontweight='bold')
+        for k in range(len(grp) - 1):
+            if grp[k] in positions and grp[k+1] in positions:
+                x1, y1 = positions[grp[k]]
+                x2, y2 = positions[grp[k+1]]
+                ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                            arrowprops=dict(arrowstyle='-', color=color,
+                                            lw=1.2, connectionstyle='arc3,rad=0.15',
+                                            alpha=0.5))
+
+    elif gtype == "net":
+        net = sub.get("net", [])
+        if len(net) >= 2 and net[0] in positions:
+            cx, cy = positions[net[0]]
+            for k in range(1, len(net)):
+                if net[k] in positions:
+                    x2, y2 = positions[net[k]]
+                    ax.annotate('', xy=(x2, y2), xytext=(cx, cy),
+                                arrowprops=dict(arrowstyle='->', color=color,
+                                                lw=1.5, connectionstyle='arc3,rad=0.15',
+                                                alpha=0.7))
+
+    # 设置边界
+    all_x = [p[0] for p in positions.values()]
+    all_y = [p[1] for p in positions.values()]
+    pad = 8
+    ax.set_xlim(min(all_x) - cell_w/2 - pad, max(all_x) + cell_w/2 + pad)
+    ax.set_ylim(min(all_y) - cell_h/2 - pad, max(all_y) + cell_h/2 + pad)
+    ax.set_aspect('equal')
+    ax.set_title(group["label"], fontsize=9, fontweight='bold',
+                 color=color, pad=3)
+    ax.axis('off')
+
+
+def _draw_input_constraints_overview(data: Dict[str, Any], ax):
+    """绘制输入约束总览图（所有 box + 颜色编码）"""
+    n = len(data["box_size"])
+    widths = [s[0] for s in data["box_size"]]
+    heights = [s[1] for s in data["box_size"]]
+    colors = _get_box_colors(data)
+
+    cols = max(3, int(np.ceil(np.sqrt(n))))
+    positions = {}
+    max_w = max(widths) * 1.5
+    max_h = max(heights) * 1.5
+    for i in range(n):
+        row = i // cols
+        col = i % cols
+        positions[i] = [col * max_w, -row * max_h]
+
+    for i in range(n):
+        x, y = positions[i][0], positions[i][1]
+        w, h = widths[i] * 0.6, heights[i] * 0.6
+        color = colors[i]
+        rect = patches.Rectangle((x, y), w, h,
+                                  linewidth=1.5, edgecolor='#333',
+                                  facecolor=color, alpha=0.7)
+        ax.add_patch(rect)
+        ax.text(x + w/2, y + h/2, f"{i+1}\n{w:.0f}×{h:.0f}",
+                ha='center', va='center', fontsize=7, fontweight='bold')
+
+    for group in data.get("symmetry_x", []):
+        for pair in group.get("symmetry_pair", []):
+            i, j = pair[0] - 1, pair[1] - 1
+            x1, y1 = positions[i][0] + widths[i]*0.3, positions[i][1] + heights[i]*0.3
+            x2, y2 = positions[j][0] + widths[j]*0.3, positions[j][1] + heights[j]*0.3
+            ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                        arrowprops=dict(arrowstyle='<->', color=_COLORS['sym_x'],
+                                       lw=1.5, connectionstyle='arc3,rad=0.3'))
+
+    for group in data.get("symmetry_y", []):
+        for pair in group.get("symmetry_pair", []):
+            i, j = pair[0] - 1, pair[1] - 1
+            x1, y1 = positions[i][0] + widths[i]*0.3, positions[i][1] + heights[i]*0.3
+            x2, y2 = positions[j][0] + widths[j]*0.3, positions[j][1] + heights[j]*0.3
+            ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                        arrowprops=dict(arrowstyle='<->', color=_COLORS['sym_y'],
+                                       lw=1.5, connectionstyle='arc3,rad=-0.3'))
+
+    legend_items = [
+        patches.Patch(color=_COLORS['sym_x'], alpha=0.7, label='X对称'),
+        patches.Patch(color=_COLORS['sym_y'], alpha=0.7, label='Y对称'),
+        patches.Patch(color=_COLORS['self_sym'], alpha=0.7, label='自对称'),
+        patches.Patch(color=_COLORS['repeat'], alpha=0.7, label='重复组'),
+        patches.Patch(color=_COLORS['align'], alpha=0.7, label='对齐'),
+        patches.Patch(color=_COLORS['net'], alpha=0.7, label='网络'),
+        patches.Patch(color=_COLORS['default'], alpha=0.7, label='无约束'),
+    ]
+    ax.legend(handles=legend_items, loc='upper right', fontsize=7)
+
+    all_x = [p[0] for p in positions.values()]
+    all_y = [p[1] for p in positions.values()]
+    ax.set_xlim(min(all_x) - max_w, max(all_x) + max_w * 2)
+    ax.set_ylim(min(all_y) - max_h, max(all_y) + max_h)
+    ax.set_aspect('equal')
+    ax.set_title('全局总览', fontsize=11, fontweight='bold')
+    ax.axis('off')
+
+
+def visualize_case(data: Dict[str, Any], algo_result: Dict[str, Any] = None,
+                   case_name: str = "", save_path: str = None):
+    """
+    可视化用例：约束分组面板 + 预期布局 + 算法布局
+
+    布局策略（嵌套 GridSpec）：
+      - 上半区：约束分组面板（每个约束组独立子图，box 可重复出现）
+      - 下半区：全局总览 + 预期布局 + 算法布局（并排大面板）
+
+    Args:
+        data: 测试用例数据 (含 input 和 expected_output)
+        algo_result: 算法输出结果 (可选)
+        case_name: 用例名称
+        save_path: 保存路径 (可选，不指定则显示)
+    """
+    from matplotlib.gridspec import GridSpec
+
+    input_data = data.get("input", data)
+    expected = data.get("expected_output", {})
+    desc = data.get("description", case_name)
+
+    widths = [s[0] for s in input_data["box_size"]]
+    heights = [s[1] for s in input_data["box_size"]]
+
+    # 提取约束组
+    groups = _extract_constraint_groups(input_data)
+    n_groups = len(groups)
+
+    has_expected = expected and expected.get("box_position")
+    has_algo = algo_result and algo_result.get("box_position")
+
+    # --- 布局计算 ---
+    # 约束面板列数（最多6列）
+    max_cols = 6
+    if n_groups <= max_cols:
+        top_cols = max(n_groups, 1)
+        top_rows = 1
+    else:
+        top_cols = max_cols
+        top_rows = int(np.ceil(n_groups / max_cols))
+
+    # 底部面板数量
+    n_bottom = 1 + (1 if has_expected else 0) + (1 if has_algo else 0)
+
+    # 总列数 = max(约束列数, 底部列数)
+    total_cols = max(top_cols, n_bottom)
+
+    # 高度比：约束区占 40%，底部占 60%
+    fig = plt.figure(figsize=(4.5 * total_cols, 4.5 * top_rows + 8))
+    
+    # 主 GridSpec：2行（约束区 + 底部区）
+    gs_main = GridSpec(2, 1, figure=fig, height_ratios=[top_rows * 4, 8], hspace=0.3)
+    
+    # 上半区：约束面板子 GridSpec
+    gs_top = gs_main[0].subgridspec(top_rows, top_cols, hspace=0.3, wspace=0.25)
+    
+    # 下半区：底部子 GridSpec
+    gs_bottom = gs_main[1].subgridspec(1, n_bottom, wspace=0.2)
+
+    fig.suptitle(desc, fontsize=16, fontweight='bold', y=0.98)
+
+    # --- 上半区：约束组面板 ---
+    for idx, group in enumerate(groups):
+        r = idx // top_cols
+        c = idx % top_cols
+        ax = fig.add_subplot(gs_top[r, c])
+        _draw_constraint_group_panel(ax, group, widths, heights)
+
+    # --- 下半区：总览 + 预期 + 算法 ---
+    plot_idx = 0
+
+    # 全局总览
+    ax_overview = fig.add_subplot(gs_bottom[0, plot_idx])
+    _draw_input_constraints_overview(input_data, ax_overview)
+    plot_idx += 1
+
+    # 预期布局
+    if has_expected:
+        ax_exp = fig.add_subplot(gs_bottom[0, plot_idx])
+        exp_cost = ""
+        try:
+            problem = Problem(input_data)
+            exp_x = [p[0] for p in expected["box_position"]]
+            exp_y = [p[1] for p in expected["box_position"]]
+            _, hpwl, area, _ = compute_cost(problem, exp_x, exp_y)
+            exp_cost = f"\nCost={10*hpwl+area:.0f} HPWL={hpwl:.0f} Area={area:.0f}"
+        except:
+            pass
+        _draw_boxes(ax_exp, input_data, expected["box_position"],
+                    f"预期布局{exp_cost}")
+        plot_idx += 1
+
+    # 算法布局
+    if has_algo:
+        ax_algo = fig.add_subplot(gs_bottom[0, plot_idx])
+        algo_cost = ""
+        if "cost" in algo_result:
+            algo_cost = (f"\nCost={algo_result['cost']:.0f} "
+                         f"HPWL={algo_result['hpwl']:.0f} "
+                         f"Area={algo_result['area']:.0f}")
+        _draw_boxes(ax_algo, input_data, algo_result["box_position"],
+                    f"算法布局{algo_cost}")
+        plot_idx += 1
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"📊 可视化已保存: {save_path}")
+    else:
+        out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                f"viz_{case_name}.png")
+        fig.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"📊 可视化已保存: {out_path}")
 
 def solve_and_report(problem: Problem, time_limit: float = 115.0,
                      strategies: List[str] = None) -> Dict[str, Any]:
@@ -694,12 +1252,15 @@ def run_single_case(data: Dict[str, Any], time_limit: float, case_name: str,
 
 
 def run_case_test(filepath: str, time_limit: float = 115.0,
-                  expected_only: bool = False) -> Dict[str, Any]:
+                  expected_only: bool = False,
+                  visualize: bool = False,
+                  viz_dir: str = 'visualizations') -> Dict[str, Any]:
     """
     对单个测试用例做完整验证:
       1. 验证 expected_output 约束
       2. 运行算法，验证算法输出约束
       3. 对比两者 cost
+      4. 可视化（可选）
     """
     case_name = os.path.basename(filepath).replace(".json", "")
     data = load_case(filepath)
@@ -725,6 +1286,10 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
         result["expected_valid"] = None
 
     if expected_only:
+        # 可视化（仅预期）
+        if visualize:
+            viz_path = os.path.join(viz_dir, f"{case_name}.png")
+            visualize_case(data, case_name=case_name, save_path=viz_path)
         return result
 
     # --- 2. 验证输入合法性 ---
@@ -734,6 +1299,10 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
         # 无解用例（如重复组尺寸矛盾）
         result["unsolvable"] = True
         result["unsolvable_reason"] = str(e)
+        # 无解用例也可视化输入约束
+        if visualize:
+            viz_path = os.path.join(viz_dir, f"{case_name}_unsolvable.png")
+            visualize_case(data, case_name=case_name, save_path=viz_path)
         return result
 
     # --- 3. 运行算法 ---
@@ -752,17 +1321,25 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
     result["algo_overlap"] = solve_result.get("overlap", 0)
     result["elapsed"] = elapsed
 
-    # --- 3. 对比 ---
+    # --- 4. 对比 ---
     if result.get("expected_cost") and result["algo_cost"]:
         exp_c = result["expected_cost"].get("cost", float("inf"))
         algo_c = result["algo_cost"].get("cost", float("inf"))
         result["cost_ratio"] = algo_c / exp_c if exp_c > 0 else float("inf")
 
+    # --- 5. 可视化 ---
+    if visualize:
+        viz_path = os.path.join(viz_dir, f"{case_name}.png")
+        visualize_case(data, algo_result=solve_result,
+                       case_name=case_name, save_path=viz_path)
+
     return result
 
 
 def _run_case_test_worker(filepath: str, time_limit: float,
-                          expected_only: bool) -> Dict[str, Any]:
+                          expected_only: bool,
+                          visualize: bool = False,
+                          viz_dir: str = 'visualizations') -> Dict[str, Any]:
     """
     子进程工作函数: 静默运行单个用例测试，返回结果。
     抑制 SA 的 print 输出，避免多进程输出混乱。
@@ -775,7 +1352,9 @@ def _run_case_test_worker(filepath: str, time_limit: float,
     try:
         with redirect_stdout(f):
             result = run_case_test(filepath, time_limit=time_limit,
-                                   expected_only=expected_only)
+                                   expected_only=expected_only,
+                                   visualize=visualize,
+                                   viz_dir=viz_dir)
         result["_sa_output"] = f.getvalue()
     except Exception as e:
         result = {
@@ -787,6 +1366,8 @@ def _run_case_test_worker(filepath: str, time_limit: float,
 
 def run_cases_parallel(filepaths: List[str], time_limit: float = 115.0,
                        expected_only: bool = False,
+                       visualize: bool = False,
+                       viz_dir: str = 'visualizations',
                        max_workers: int = None) -> List[Dict[str, Any]]:
     """
     并行运行多个测试用例。
@@ -817,7 +1398,8 @@ def run_cases_parallel(filepaths: List[str], time_limit: float = 115.0,
         future_to_idx = {}
         for idx, filepath in enumerate(filepaths):
             future = executor.submit(_run_case_test_worker, filepath,
-                                     time_limit, expected_only)
+                                     time_limit, expected_only,
+                                     visualize, viz_dir)
             future_to_idx[future] = idx
 
         completed = 0
@@ -998,13 +1580,16 @@ def print_run_summary(results: List[tuple]):
 # ============================================================
 
 def _run_test_suite(cases: List[str], time_limit: float, expected_only: bool,
-                    verbose: bool, parallel: bool, max_workers: int = None):
+                    verbose: bool, parallel: bool, max_workers: int = None,
+                    visualize: bool = False, viz_dir: str = 'visualizations'):
     """统一测试套件执行入口，支持串行/并行。"""
     print(f"🦐 代码虾测试运行器")
     print(f"   找到 {len(cases)} 个用例")
     print(f"   时间限制: {time_limit}s/用例")
     if expected_only:
         print(f"   模式: 仅验证预期输出")
+    if visualize:
+        print(f"   可视化: 输出到 {viz_dir}/")
     if parallel:
         workers = max_workers or min(multiprocessing.cpu_count(), len(cases))
         print(f"   并行: {workers} 进程")
@@ -1014,6 +1599,8 @@ def _run_test_suite(cases: List[str], time_limit: float, expected_only: bool,
         # 并行执行
         results = run_cases_parallel(cases, time_limit=time_limit,
                                      expected_only=expected_only,
+                                     visualize=visualize,
+                                     viz_dir=viz_dir,
                                      max_workers=max_workers)
         # 详细报告
         if verbose:
@@ -1027,7 +1614,9 @@ def _run_test_suite(cases: List[str], time_limit: float, expected_only: bool,
             print(f"▶ 正在处理: {os.path.basename(filepath)}...")
             try:
                 r = run_case_test(filepath, time_limit=time_limit,
-                                  expected_only=expected_only)
+                                  expected_only=expected_only,
+                                  visualize=visualize,
+                                  viz_dir=viz_dir)
                 results.append(r)
                 print_case_result(r, verbose=verbose)
             except Exception as e:
@@ -1060,6 +1649,8 @@ def _parse_arguments() -> Dict[str, Any]:
         'validate': False,
         'expected_only': False,
         'verbose': False,
+        'visualize': False,
+        'viz_dir': 'visualizations',
         'list_cases': False,
         'directory': None,
         'parallel': False,
@@ -1087,6 +1678,12 @@ def _parse_arguments() -> Dict[str, Any]:
         elif arg == "--verbose" or arg == "-v":
             config['verbose'] = True
             i += 1
+        elif arg == "--visualize" or arg == "-V":
+            config['visualize'] = True
+            i += 1
+        elif arg == "--viz-dir" and i + 1 < len(sys.argv):
+            config['viz_dir'] = sys.argv[i + 1]
+            i += 2
         elif arg == "--parallel" or arg == "-j":
             config['parallel'] = True
             if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit():
@@ -1158,7 +1755,8 @@ def _handle_directory_mode(config: Dict[str, Any]):
     if use_test_mode:
         # Test mode
         _run_test_suite(cases, config['time_limit'], config['expected_only'],
-                        config['verbose'], config['parallel'], config['max_workers'])
+                        config['verbose'], config['parallel'], config['max_workers'],
+                        config['visualize'], config['viz_dir'])
     else:
         # Run mode
         return cases
@@ -1257,7 +1855,8 @@ def main():
     use_test_mode = config['validate'] or (config['directory'] and "test_cases" in config['directory'])
     if use_test_mode and not config['directory']:
         _run_test_suite(input_files, config['time_limit'], config['expected_only'],
-                        config['verbose'], config['parallel'], config['max_workers'])
+                        config['verbose'], config['parallel'], config['max_workers'],
+                        config['visualize'], config['viz_dir'])
         return
     
     # Run mode
