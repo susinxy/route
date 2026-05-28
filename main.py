@@ -35,6 +35,8 @@ import sys
 import os
 import glob
 import time
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -535,6 +537,105 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
     return result
 
 
+def _run_case_test_worker(filepath: str, time_limit: float,
+                          expected_only: bool) -> Dict[str, Any]:
+    """
+    子进程工作函数: 静默运行单个用例测试，返回结果。
+    抑制 SA 的 print 输出，避免多进程输出混乱。
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    # 捕获 SA 的维测打印，不输出到终端
+    f = io.StringIO()
+    try:
+        with redirect_stdout(f):
+            result = run_case_test(filepath, time_limit=time_limit,
+                                   expected_only=expected_only)
+        result["_sa_output"] = f.getvalue()
+    except Exception as e:
+        result = {
+            "case": os.path.basename(filepath).replace(".json", ""),
+            "error": str(e),
+        }
+    return result
+
+
+def run_cases_parallel(filepaths: List[str], time_limit: float = 115.0,
+                       expected_only: bool = False,
+                       max_workers: int = None) -> List[Dict[str, Any]]:
+    """
+    并行运行多个测试用例。
+
+    Args:
+        filepaths: 测试用例文件路径列表
+        time_limit: 每个用例的时间限制
+        expected_only: 是否只验证预期输出
+        max_workers: 最大并行进程数，默认 CPU 核心数
+
+    Returns:
+        结果列表，顺序与 filepaths 对应
+    """
+    if max_workers is None:
+        max_workers = min(multiprocessing.cpu_count(), len(filepaths))
+
+    total = len(filepaths)
+    results = [None] * total
+    case_names = [os.path.basename(f).replace(".json", "") for f in filepaths]
+
+    print(f"🚀 并行模式: {total} 个用例, {max_workers} 进程")
+    print(f"   用例: {', '.join(case_names)}")
+    print()
+
+    t0 = time.time()
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {}
+        for idx, filepath in enumerate(filepaths):
+            future = executor.submit(_run_case_test_worker, filepath,
+                                     time_limit, expected_only)
+            future_to_idx[future] = idx
+
+        completed = 0
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+                results[idx] = result
+                completed += 1
+
+                # 进度报告
+                name = case_names[idx]
+                status = "✅" if result.get("algo_valid", result.get("expected_valid")) else "❌"
+                if "error" in result:
+                    status = "💥"
+                elapsed = result.get("elapsed", 0)
+                cost = ""
+                if result.get("algo_cost") and "cost" in result["algo_cost"]:
+                    cost = f", cost={result['algo_cost']['cost']:.0f}"
+                ratio = ""
+                if result.get("cost_ratio"):
+                    ratio = f", ratio={result['cost_ratio']:.3f}"
+
+                wall = time.time() - t0
+                print(f"  [{completed}/{total}] {status} {name} "
+                      f"({elapsed:.1f}s{cost}{ratio}) "
+                      f"[wall {wall:.1f}s]")
+
+            except Exception as e:
+                results[idx] = {
+                    "case": case_names[idx],
+                    "error": str(e),
+                }
+                completed += 1
+                print(f"  [{completed}/{total}] 💥 {case_names[idx]}: {e}")
+
+    wall = time.time() - t0
+    print(f"\n⏱️  总耗时: {wall:.1f}s (wall clock)")
+
+    return results
+
+
 # ============================================================
 # 报告输出
 # ============================================================
@@ -651,6 +752,61 @@ def print_run_summary(results: List[tuple]):
 
 
 # ============================================================
+# 测试套件执行器
+# ============================================================
+
+def _run_test_suite(cases: List[str], time_limit: float, expected_only: bool,
+                    verbose: bool, parallel: bool, max_workers: int = None):
+    """统一测试套件执行入口，支持串行/并行。"""
+    print(f"🦐 代码虾测试运行器")
+    print(f"   找到 {len(cases)} 个用例")
+    print(f"   时间限制: {time_limit}s/用例")
+    if expected_only:
+        print(f"   模式: 仅验证预期输出")
+    if parallel:
+        workers = max_workers or min(multiprocessing.cpu_count(), len(cases))
+        print(f"   并行: {workers} 进程")
+    print()
+
+    if parallel and not expected_only and len(cases) > 1:
+        # 并行执行
+        results = run_cases_parallel(cases, time_limit=time_limit,
+                                     expected_only=expected_only,
+                                     max_workers=max_workers)
+        # 详细报告
+        if verbose:
+            for r in results:
+                if r:
+                    print_case_result(r, verbose=verbose)
+    else:
+        # 串行执行
+        results = []
+        for filepath in cases:
+            print(f"▶ 正在处理: {os.path.basename(filepath)}...")
+            try:
+                r = run_case_test(filepath, time_limit=time_limit,
+                                  expected_only=expected_only)
+                results.append(r)
+                print_case_result(r, verbose=verbose)
+            except Exception as e:
+                print(f"❌ 执行失败: {e}")
+                import traceback
+                traceback.print_exc()
+                results.append({
+                    "case": os.path.basename(filepath).replace(".json", ""),
+                    "error": str(e)
+                })
+
+    print_summary(results)
+
+    any_fail = any(
+        r.get("expected_valid") is False or r.get("algo_valid") is False
+        for r in results if r
+    )
+    sys.exit(1 if any_fail else 0)
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -664,6 +820,8 @@ def main():
     list_cases = False
     directory = None
     filter_name = None
+    parallel = False
+    max_workers = None
 
     # 解析命令行参数
     args = []
@@ -686,6 +844,13 @@ def main():
         elif arg == "--verbose" or arg == "-v":
             verbose = True
             i += 1
+        elif arg == "--parallel" or arg == "-j":
+            parallel = True
+            if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit():
+                max_workers = int(sys.argv[i + 1])
+                i += 2
+            else:
+                i += 1
         elif arg == "--list-strategies":
             print("可用的初始化策略:")
             for strategy in SimulatedAnnealing.get_available_strategies():
@@ -751,37 +916,8 @@ def main():
 
         if use_test_mode:
             # 测试模式
-            print(f"🦐 代码虾测试运行器")
-            print(f"   找到 {len(cases)} 个用例")
-            print(f"   时间限制: {time_limit}s/用例")
-            if expected_only:
-                print(f"   模式: 仅验证预期输出")
-            print()
-
-            results = []
-            for filepath in cases:
-                print(f"▶ 正在处理: {os.path.basename(filepath)}...")
-                try:
-                    r = run_case_test(filepath, time_limit=time_limit,
-                                      expected_only=expected_only)
-                    results.append(r)
-                    print_case_result(r, verbose=verbose)
-                except Exception as e:
-                    print(f"❌ 执行失败: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    results.append({
-                        "case": os.path.basename(filepath).replace(".json", ""),
-                        "error": str(e)
-                    })
-
-            print_summary(results)
-
-            any_fail = any(
-                r.get("expected_valid") is False or r.get("algo_valid") is False
-                for r in results
-            )
-            sys.exit(1 if any_fail else 0)
+            _run_test_suite(cases, time_limit, expected_only, verbose,
+                            parallel, max_workers)
         else:
             # 运行模式
             input_files = cases
@@ -807,48 +943,22 @@ def main():
         print("Usage:")
         print("  python main.py input.json [--time 115] [--strategies s1,s2]")
         print("  python main.py case1.json case2.json [--time 115]")
-        print("  python main.py -d ./test_cases --validate [--time 30]")
+        print("  python main.py -d ./test_cases --validate [--time 30] [-j 4]")
         print("  python main.py -d ./test_cases --expected-only")
         print("  python main.py --validate case01 [--time 30]")
         print("  python main.py -t [--time 30]")
         print("  python main.py --list-cases")
         print("  python main.py --list-strategies")
+        print("\nParallel mode:")
+        print("  python main.py -d ./test_cases --validate --time 30 -j 8  # 8 processes")
+        print("  python main.py -d ./test_cases --validate --time 30 -j    # auto (CPU count)")
         sys.exit(1)
 
     # ---- 运行模式 ----
     if use_test_mode and not directory:
         # 按名称过滤的测试用例
-        print(f"🦐 代码虾测试运行器")
-        print(f"   找到 {len(input_files)} 个用例")
-        print(f"   时间限制: {time_limit}s/用例")
-        if expected_only:
-            print(f"   模式: 仅验证预期输出")
-        print()
-
-        results = []
-        for filepath in input_files:
-            print(f"▶ 正在处理: {os.path.basename(filepath)}...")
-            try:
-                r = run_case_test(filepath, time_limit=time_limit,
-                                  expected_only=expected_only)
-                results.append(r)
-                print_case_result(r, verbose=verbose)
-            except Exception as e:
-                print(f"❌ 执行失败: {e}")
-                import traceback
-                traceback.print_exc()
-                results.append({
-                    "case": os.path.basename(filepath).replace(".json", ""),
-                    "error": str(e)
-                })
-
-        print_summary(results)
-
-        any_fail = any(
-            r.get("expected_valid") is False or r.get("algo_valid") is False
-            for r in results
-        )
-        sys.exit(1 if any_fail else 0)
+        _run_test_suite(input_files, time_limit, expected_only, verbose,
+                        parallel, max_workers)
 
     # 普通运行模式
     if len(input_files) == 1:
