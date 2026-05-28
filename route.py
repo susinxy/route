@@ -13,6 +13,8 @@ from typing import List, Dict, Tuple, Set, Any
 
 import numpy as np
 
+# SA 优化时每个 box 向外膨胀的边距，迫使解保持间距避免微小重叠
+OVERLAP_MARGIN = 0.02
 
 # ============================================================
 # 数据模型
@@ -138,6 +140,8 @@ class ConstraintSystem:
                 cx_i = self.var_exprs[i] + p.widths[i] / 2
                 cx_j = self.var_exprs[j] + p.widths[j] / 2
                 self._add_equation(cx_i + cx_j - axis_expr * 2)
+                # X对称要求 pair 的 y 坐标相同
+                self._add_equation(self.var_exprs[n + i] - self.var_exprs[n + j])
             for s in group.get("self_symmetry", []):
                 s -= 1
                 cx_s = self.var_exprs[s] + p.widths[s] / 2
@@ -151,6 +155,8 @@ class ConstraintSystem:
                 cy_i = self.var_exprs[n + i] + p.heights[i] / 2
                 cy_j = self.var_exprs[n + j] + p.heights[j] / 2
                 self._add_equation(cy_i + cy_j - axis_expr * 2)
+                # Y对称要求 pair 的 x 坐标相同
+                self._add_equation(self.var_exprs[i] - self.var_exprs[j])
             for s in group.get("self_symmetry", []):
                 s -= 1
                 cy_s = self.var_exprs[n + s] + p.heights[s] / 2
@@ -289,25 +295,38 @@ def compute_area(problem: Problem, x: List[float], y: List[float]) -> float:
     return (max_x - min_x) * (max_y - min_y)
 
 
-def compute_overlap_penalty(problem: Problem, x: List[float], y: List[float]) -> float:
+def compute_overlap_penalty(problem: Problem, x: List[float], y: List[float],
+                             margin: float = 0.0) -> float:
+    """
+    计算重叠惩罚。margin > 0 时，每个 box 四边各扩 margin/2，
+    使 SA 在优化过程中主动保持间距，避免微小重叠。
+    """
     n = problem.n
+    half = margin / 2
     total = 0.0
     for i in range(n):
+        wi = problem.widths[i] + margin
+        hi = problem.heights[i] + margin
+        xi = x[i] - half
+        yi = y[i] - half
         for j in range(i + 1, n):
-            ox = max(0, min(x[i] + problem.widths[i], x[j] + problem.widths[j])
-                     - max(x[i], x[j]))
-            oy = max(0, min(y[i] + problem.heights[i], y[j] + problem.heights[j])
-                     - max(y[i], y[j]))
+            wj = problem.widths[j] + margin
+            hj = problem.heights[j] + margin
+            xj = x[j] - half
+            yj = y[j] - half
+            ox = max(0, min(xi + wi, xj + wj) - max(xi, xj))
+            oy = max(0, min(yi + hi, yj + hj) - max(yi, yj))
             total += ox * oy
     return total
 
 
 def compute_cost(problem: Problem, x: List[float], y: List[float],
-                 overlap_lambda: float = 0.0) -> Tuple[float, float, float, float]:
+                 overlap_lambda: float = 0.0,
+                 margin: float = 0.0) -> Tuple[float, float, float, float]:
     """返回 (total_cost, hpwl, area, overlap)"""
     hpwl = compute_hpwl(problem, x, y)
     area = compute_area(problem, x, y)
-    overlap = compute_overlap_penalty(problem, x, y)
+    overlap = compute_overlap_penalty(problem, x, y, margin=margin)
     total = 10 * hpwl + area + overlap_lambda * overlap
     return total, hpwl, area, overlap
 
@@ -693,7 +712,7 @@ class SimulatedAnnealing:
         box_scale = sorted(all_dims)[len(all_dims) // 2]
 
         r = random.random()
-        if r < 0.15 and self.best_overlap < 0.01:
+        if r < 0.15 and self.best_overlap < 0.001:
             # Compression move: scale all vars toward center of mass
             factor = 1.0 - random.uniform(0.005, 0.03)
             center = np.mean(new_vars)
@@ -915,6 +934,8 @@ class SimulatedAnnealing:
         current_x, current_y = self._decode_fast(current_arr)
         _, current_hpwl, current_area, current_overlap = \
             compute_cost(self.problem, current_x, current_y)
+        _, _, _, current_overlap_m = \
+            compute_cost(self.problem, current_x, current_y, margin=OVERLAP_MARGIN)
         current_real_cost = 10 * current_hpwl + current_area
         layout_scale = self._compute_layout_scale(current_x, current_y)
 
@@ -930,8 +951,8 @@ class SimulatedAnnealing:
             self.iterations += 1
 
             progress = (time.time() - local_t0) / time_budget
-            if current_overlap > 0.01:
-                # 更强的重叠惩罚，迫使快速消除重叠
+            if current_overlap_m > 0.01:
+                # 更强的重叠惩罚（含 margin），迫使快速消除重叠并保持间距
                 overlap_lambda = 50000.0 * (1 + progress * 100)
                 area_lambda = 0.0
             else:
@@ -946,11 +967,15 @@ class SimulatedAnnealing:
 
             new_arr = self._perturb(current_arr, temperature, max_temp, layout_scale)
             new_x, new_y = self._decode_fast(new_arr)
-            new_total, new_hpwl, new_area, new_overlap = \
-                compute_cost(self.problem, new_x, new_y, overlap_lambda)
+            # 用 margin 版 overlap 做 SA 引导
+            new_total, new_hpwl, new_area, new_overlap_m = \
+                compute_cost(self.problem, new_x, new_y, overlap_lambda,
+                             margin=OVERLAP_MARGIN)
+            # 同时算真实 overlap 用于报告
+            new_real_overlap = compute_overlap_penalty(self.problem, new_x, new_y)
             new_real_cost = 10 * new_hpwl + new_area + area_lambda * new_area
 
-            current_total = current_real_cost + overlap_lambda * current_overlap
+            current_total = current_real_cost + overlap_lambda * current_overlap_m
             delta = new_total - current_total
 
             accept = False
@@ -965,7 +990,8 @@ class SimulatedAnnealing:
                 current_arr = new_arr
                 current_real_cost = new_real_cost
                 current_x, current_y = new_x, new_y
-                current_overlap = new_overlap
+                current_overlap = new_real_overlap
+                current_overlap_m = new_overlap_m
                 self.accepted += 1
                 no_improve = 0
 
@@ -990,15 +1016,15 @@ class SimulatedAnnealing:
                       f"time={elapsed:.1f}s")
 
     def _update_best(self, var_arr, x, y, real_cost, overlap):
-        if overlap < 0.01:
-            if real_cost < self.best_cost or self.best_overlap >= 0.01:
+        if overlap < 0.001:
+            if real_cost < self.best_cost or self.best_overlap >= 0.001:
                 self.best_cost = real_cost
                 self.best_values = {fv: float(var_arr[j])
                                    for j, fv in enumerate(self.free_vars)}
                 self.best_x = x.copy()
                 self.best_y = y.copy()
                 self.best_overlap = overlap
-        elif self.best_overlap >= 0.01 and overlap < self.best_overlap:
+        elif self.best_overlap >= 0.001 and overlap < self.best_overlap:
             self.best_values = {fv: float(var_arr[j])
                                for j, fv in enumerate(self.free_vars)}
             self.best_x = x.copy()
@@ -1212,7 +1238,10 @@ def _postprocess(problem: Problem, cs: ConstraintSystem,
     current_values = {fv: float(result[j]) for j, fv in enumerate(free_vars)}
 
     best_values = current_values.copy()
-    best_overlap = compute_overlap_penalty(problem, x_coords, y_coords)
+    # 用 margin 版 overlap 做引导，让后处理也主动保持间距
+    best_overlap_m = compute_overlap_penalty(problem, x_coords, y_coords,
+                                              margin=OVERLAP_MARGIN)
+    best_real_overlap = compute_overlap_penalty(problem, x_coords, y_coords)
     best_x = x_coords.copy()
     best_y = y_coords.copy()
 
@@ -1228,15 +1257,18 @@ def _postprocess(problem: Problem, cs: ConstraintSystem,
         delta = step * (1 if iteration % 2 == 0 else -1) * (0.5 + 0.5 * np.random.random())
         new_values[var] += delta
         new_x, new_y = cs.decode(new_values)
-        new_overlap = compute_overlap_penalty(problem, new_x, new_y)
+        new_overlap_m = compute_overlap_penalty(problem, new_x, new_y,
+                                                 margin=OVERLAP_MARGIN)
+        new_real_overlap = compute_overlap_penalty(problem, new_x, new_y)
 
-        if new_overlap < best_overlap:
-            best_overlap = new_overlap
+        if new_overlap_m < best_overlap_m:
+            best_overlap_m = new_overlap_m
+            best_real_overlap = new_real_overlap
             best_values = new_values.copy()
             best_x = new_x.copy()
             best_y = new_y.copy()
             current_values = new_values
-            if new_overlap < 0.001:
+            if new_real_overlap < 0.001:
                 break
         step *= 0.999
 

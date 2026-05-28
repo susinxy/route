@@ -1,0 +1,32 @@
+{
+  "description": "用例1: 纯X轴对称 (symmetry_pair + self_symmetry)",
+  "input": {
+    "box_size": [
+      [10.000, 5.000],
+      [10.000, 5.000],
+      [8.000, 4.000],
+      [8.000, 4.000],
+      [6.000, 6.000],
+      [4.000, 8.000]
+    ],
+    "symmetry_x": [{
+      "symmetry_pair": [[1, 2], [3, 4]],
+      "self_symmetry": [5, 6]
+    }],
+    "symmetry_y": [],
+    "repeat_groups": [],
+    "align": { "left": [], "right": [], "top": [], "bottom": [] },
+    "nets": [[1, 3, 5], [2, 4, 6]],
+    "start_from_1": true
+  },
+  "expected_output": {
+    "box_position": [
+      [35.0, 0.0],
+      [15.0, 0.0],
+      [41.0, 10.0],
+      [11.0, 10.0],
+      [27.0, 20.0],
+      [28.0, 30.0]
+    ]
+  }
+}
