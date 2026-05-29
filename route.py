@@ -371,7 +371,6 @@ def compute_overlap_penalty(problem: Problem, x, y, margin: float = 0.0) -> floa
 def compute_proximity_penalty(problem: Problem, x, y,
                                repeat_group_weight: float = 2.0,
                                net_weight: float = 0.5,
-                               align_weight: float = 1.5,
                                group_size_power: float = 0.5) -> float:
     """
     向量化组内紧凑度惩罚。
@@ -405,20 +404,6 @@ def compute_proximity_penalty(problem: Problem, x, y,
                          (np.max(cy[idx]) - np.min(cy[idx])))
         size_factor = (len(idx) / 2.0) ** group_size_power
         total += net_weight * bbox_area * size_factor
-    
-    # 3. 对齐组
-    all_align_groups = (
-        problem.align_left + problem.align_right +
-        problem.align_top + problem.align_bottom
-    )
-    for group in all_align_groups:
-        idx = np.array([b - 1 for b in group])
-        if len(idx) < 2:
-            continue
-        bbox_area = float((np.max(cx[idx]) - np.min(cx[idx])) *
-                         (np.max(cy[idx]) - np.min(cy[idx])))
-        size_factor = (len(idx) / 2.0) ** group_size_power
-        total += align_weight * bbox_area * size_factor
     
     return total
 
@@ -813,18 +798,50 @@ class SimulatedAnnealing:
             elapsed = time.time() - t0
             print(f"    [轮 {round_num}] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
 
-        # Phase 2: Deep optimization from best solution
+        # Phase 2: Multi-round restart optimization from best solution
+        # Split remaining time into sub-rounds to avoid temperature dead zone.
+        # Each sub-round restarts temperature, preventing the SA from getting
+        # stuck at T=0 for most of the budget (the root cause of 120s < 30s).
         remaining = self.time_limit - (time.time() - t0)
         if remaining > 1.0 and self.best_cost < float('inf'):
-            round_num += 1
-            elapsed = time.time() - t0
-            print(f"  [阶段2] 深度优化最佳初始解...")
-            self._run_round(
-                lambda: np.array([self.best_values[fv] for fv in self.free_vars]),
-                remaining, round_num
-            )
-            elapsed = time.time() - t0
-            print(f"    [深度优化] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
+            # Sub-round duration: 15-25s depending on remaining time
+            # Short enough to restart temp multiple times,
+            # long enough to converge within each round
+            sub_round_sec = min(25.0, max(15.0, remaining / 4.0))
+            sub_round_num = 0
+            while (time.time() - t0) < self.time_limit - 1.0:
+                sub_round_num += 1
+                round_num += 1
+                sub_remaining = self.time_limit - (time.time() - t0)
+                if sub_remaining < 2.0:
+                    break
+                budget = min(sub_round_sec, sub_remaining - 0.5)
+                if budget < 5.0:
+                    budget = sub_remaining
+                if budget < 5.0:
+                    break  # Too little time for a meaningful round
+
+                # Start from current best, with slight random perturbation
+                # to escape local optima (except first sub-round)
+                best_arr = np.array([self.best_values[fv] for fv in self.free_vars])
+                if sub_round_num > 1:
+                    # Add scaled noise to escape local optima.
+                    # 15% of layout spread — enough to explore new regions
+                    # without destroying the overall structure.
+                    spread = float(np.ptp(best_arr))
+                    noise_scale = spread * 0.15
+                    best_arr = best_arr + np.random.randn(len(best_arr)) * noise_scale
+
+                elapsed = time.time() - t0
+                print(f"  [阶段2.{sub_round_num}] 重启优化, "
+                      f"budget={budget:.1f}s, prev_best={self.best_cost:.2f}")
+                self._run_round(
+                    lambda arr=best_arr: arr,
+                    budget, round_num
+                )
+                elapsed = time.time() - t0
+                print(f"    [阶段2.{sub_round_num}] cost={self.best_cost:.2f}, "
+                      f"time={elapsed:.1f}s")
 
         elapsed = time.time() - t0
         print(f"\nSA 完成: {round_num} 轮, iter={self.iterations}, "
@@ -854,7 +871,11 @@ class SimulatedAnnealing:
 
         max_temp = layout_scale * 100.0
         temperature = max_temp
-        alpha = 0.99995
+        # Dynamic alpha: scale so temperature reaches ~1% of max_temp
+        # at ~80% of the time budget. Estimate ~15K iter/sec.
+        est_iters = time_budget * 15000
+        target_iters = max(est_iters * 0.8, 10000)
+        alpha = 0.01 ** (1.0 / target_iters)  # alpha^N = 0.01
         no_improve = 0
 
         while (time.time() - local_t0) < time_budget:
@@ -902,14 +923,19 @@ class SimulatedAnnealing:
                              margin=OVERLAP_MARGIN, proximity_weight=proximity_w,
                              group_size_power=group_size_power)
             new_real_overlap = compute_overlap_penalty(self.problem, new_x, new_y)
-            new_real_cost = 10 * new_hpwl + new_area + area_lambda * new_area
+            new_real_cost = 10 * new_hpwl + new_area  # True cost, no penalties
 
-            current_total = current_real_cost + overlap_lambda * current_overlap_m
+            # For acceptance: new_total already has overlap+proximity from compute_cost.
+            # Add area_lambda here to guide area optimization.
+            new_total_guided = new_total + area_lambda * new_area
+
+            current_total = current_real_cost + area_lambda * current_area + \
+                            overlap_lambda * current_overlap_m
             if proximity_w > 0:
                 current_total += proximity_w * compute_proximity_penalty(
                     self.problem, current_x, current_y,
                     group_size_power=group_size_power)
-            delta = new_total - current_total
+            delta = new_total_guided - current_total
 
             accept = False
             if delta < 0:
@@ -921,7 +947,8 @@ class SimulatedAnnealing:
 
             if accept:
                 current_arr = new_arr
-                current_real_cost = new_real_cost
+                current_real_cost = new_real_cost  # True cost only
+                current_area = new_area  # Track area for area_lambda in next delta
                 current_x, current_y = new_x, new_y
                 current_overlap = new_real_overlap
                 current_overlap_m = new_overlap_m
@@ -932,7 +959,7 @@ class SimulatedAnnealing:
                     layout_scale = self._compute_layout_scale(current_x, current_y)
 
                 self._update_best(current_arr, current_x, current_y,
-                                current_real_cost, current_overlap)
+                                new_real_cost, current_overlap)
             else:
                 no_improve += 1
 
@@ -1140,13 +1167,16 @@ def _compress_layout(problem: Problem, cs: ConstraintSystem,
                     {fv: float(new_arr[j]) for j, fv in enumerate(free_vars)})
                 
                 overlap = compute_overlap_penalty(problem, new_x, new_y)
-                if overlap > 15.0:
+                # Only accept if no overlap introduced (overlap < 0.001)
+                # or if it reduces existing overlap
+                if overlap > 0.001 and overlap >= overlap0:
                     continue
                 
                 _, new_hpwl, new_area, new_overlap = compute_cost(problem, new_x, new_y)
                 new_cost = 10 * new_hpwl + new_area
                 
-                if new_cost < best_scale_cost * 0.995:
+                # Only accept if cost improves AND overlap doesn't worsen
+                if new_cost < best_scale_cost * 0.995 and new_overlap <= overlap0:
                     best_scale_cost = new_cost
                     best_scale_combo = (sx, sy)
         
