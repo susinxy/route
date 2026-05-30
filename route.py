@@ -211,6 +211,54 @@ class ConstraintSystem:
             if len(groups) < 2:
                 continue
             ref_group = groups[0]
+            
+            # 方向2：如果模板 group 的 box 数过多，强制网格排列
+            # 阈值：4 个 box（8 个变量），超过就固定相对位置
+            if len(ref_group) > 5:
+                # 计算网格布局：按 box 顺序排列成紧凑网格
+                num_boxes = len(ref_group)
+                cols = int(num_boxes ** 0.5 + 0.5)
+                rows = (num_boxes + cols - 1) // cols
+                
+                # 计算每列最大宽度和每行最大高度
+                col_widths = []
+                for c in range(cols):
+                    indices = [r * cols + c for r in range(rows) if r * cols + c < num_boxes]
+                    col_widths.append(max(p.widths[ref_group[i]] for i in indices))
+                
+                row_heights = []
+                for r in range(rows):
+                    indices = [r * cols + c for c in range(cols) if r * cols + c < num_boxes]
+                    row_heights.append(max(p.heights[ref_group[i]] for i in indices))
+                
+                # 计算每列 X 偏移和每行 Y 偏移
+                col_offsets = [0.0]
+                for c in range(1, cols):
+                    col_offsets.append(col_offsets[-1] + col_widths[c - 1])
+                
+                row_offsets = [0.0]
+                for r in range(1, rows):
+                    row_offsets.append(row_offsets[-1] + row_heights[r - 1])
+                
+                # 模板 group 的第一个 box 作为锚点 (x0, y0)
+                anchor_box = ref_group[0]
+                
+                # 对模板 group 内的其他 box，添加网格约束
+                for i in range(1, len(ref_group)):
+                    box = ref_group[i]
+                    col = i % cols
+                    row = i // cols
+                    
+                    dx = col_offsets[col]
+                    dy = row_offsets[row]
+                    
+                    # 添加方程：box_x = anchor_x + dx, box_y = anchor_y + dy
+                    self._add_equation(
+                        self.var_exprs[box] - self.var_exprs[anchor_box] - LinearExpr({}, dx))
+                    self._add_equation(
+                        self.var_exprs[n + box] - self.var_exprs[n + anchor_box] - LinearExpr({}, dy))
+            
+            # 其他 group 与模板的偏移（保持不变）
             for g_idx in range(1, len(groups)):
                 group = groups[g_idx]
                 dx_var = self._new_var()
@@ -1435,6 +1483,7 @@ def _place_free_box_smart(problem: Problem, fb: int, box_type: str,
             for dx in [-2, -1, 0, 1, 2]:
                 for dy in [-2, -1, 0, 1, 2]:
                     candidates.append((avg_cx - w/2 + dx * w, avg_cy - h/2 + dy * h))
+
 
     # 评估每个候选
     best_pos = (bbox_max_x + OVERLAP_MARGIN, bbox_min_y)  # fallback
