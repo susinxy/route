@@ -748,7 +748,8 @@ class SimulatedAnnealing:
                            f"Available: {self.get_available_strategies()}")
         return lambda: strategies[strategy_name](seed_offset)
 
-    def run(self, strategies: List[str] = None) -> Tuple[List[float], List[float], float]:
+    def run(self, strategies: List[str] = None, 
+            initial_vars: 'np.ndarray | None' = None) -> Tuple[List[float], List[float], float]:
         """
         Run simulated annealing optimization.
 
@@ -773,30 +774,41 @@ class SimulatedAnnealing:
                 'random_tight'
             ]
 
-        # Build init functions
-        init_strategies = []
-        for i, strategy_name in enumerate(strategies):
-            # Use different seeds for different rounds
-            seed_offset = i * 1000
-            init_strategies.append(self._get_strategy_function(strategy_name, seed_offset))
-
-        # Phase 1: Try multiple initial strategies
-        exploration_time = min(self.time_limit * 0.25, 15.0)
         round_num = 0
 
-        while (time.time() - t0) < exploration_time and round_num < len(init_strategies):
-            round_num += 1
-            strategy = init_strategies[round_num - 1]
+        if initial_vars is not None:
+            # External initial solution provided (e.g., from Phase A+B greedy)
+            # Skip exploration, directly seed best and go to Phase 2
+            init_x, init_y = self._decode_fast(initial_vars)
+            _, init_hpwl, init_area, init_overlap = \
+                compute_cost(self.problem, init_x, init_y)
+            init_real_cost = 10 * init_hpwl + init_area
+            self._update_best(initial_vars, init_x, init_y,
+                             init_real_cost, init_overlap)
+            print(f"    [初始解] cost={init_real_cost:.2f}, overlap={init_overlap:.2f}")
+        else:
+            # Build init functions
+            init_strategies = []
+            for i, strategy_name in enumerate(strategies):
+                seed_offset = i * 1000
+                init_strategies.append(self._get_strategy_function(strategy_name, seed_offset))
 
-            time_budget = min(
-                (exploration_time - (time.time() - t0)) / max(1, len(init_strategies) - round_num + 1),
-                8.0
-            )
-            time_budget = max(time_budget, 2.0)
+            # Phase 1: Try multiple initial strategies
+            exploration_time = min(self.time_limit * 0.25, 15.0)
 
-            self._run_round(strategy, time_budget, round_num)
-            elapsed = time.time() - t0
-            print(f"    [轮 {round_num}] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
+            while (time.time() - t0) < exploration_time and round_num < len(init_strategies):
+                round_num += 1
+                strategy = init_strategies[round_num - 1]
+
+                time_budget = min(
+                    (exploration_time - (time.time() - t0)) / max(1, len(init_strategies) - round_num + 1),
+                    8.0
+                )
+                time_budget = max(time_budget, 2.0)
+
+                self._run_round(strategy, time_budget, round_num)
+                elapsed = time.time() - t0
+                print(f"    [轮 {round_num}] cost={self.best_cost:.2f}, time={elapsed:.1f}s")
 
         # Phase 2: Multi-round restart optimization from best solution
         # Split remaining time into sub-rounds to avoid temperature dead zone.
@@ -1531,10 +1543,9 @@ def _partitioned_solve(problem: Problem, time_limit: float = 115.0,
     # bbox expansion 会破坏对称/自对称约束，已移除
     # Phase B 的 smart placement 会在 bbox 外自动找空位放置 free boxes
 
-    # Phase B: 分策略智能放置 free boxes (Whitespace Management)
-    phase_b_budget = time_limit * 0.5
-    print(f"  Phase B: 放置 {len(free_boxes)} 个 free boxes "
-          f"(budget={phase_b_budget:.0f}s)")
+    # Phase B: 贪心初始化 + 全局 SA
+    phase_b_budget = time_limit * 0.6
+    print(f"  Phase B: 贪心初始化 + 全局 SA (budget={phase_b_budget:.0f}s)")
 
     # 初始化全坐标数组
     final_x = [0.0] * n
@@ -1617,6 +1628,30 @@ def _partitioned_solve(problem: Problem, time_limit: float = 115.0,
         bw, bh = float(problem.w_arr[fb]), float(problem.h_arr[fb])
         placed.append((pos[0], pos[1], bw, bh, fb))
         _update_bbox(pos, bw, bh)
+
+    greedy_time = time.time() - t0 - elapsed_a
+    print(f"    贪心初始化完成: time={greedy_time:.1f}s")
+
+    # Step 4: 全局 SA 精炼
+    remaining_time = phase_b_budget - greedy_time
+    if remaining_time > 5.0:
+        print(f"    全局 SA 精炼: {remaining_time:.0f}s")
+        
+        # 构建全局约束系统和 SA
+        global_cs = ConstraintSystem(problem)
+        global_sa = SimulatedAnnealing(problem, global_cs, time_limit=remaining_time)
+        
+        # 把当前坐标编码为全局变量数组（逆解码）
+        global_vars = global_sa._fit_to_target(final_x, final_y)
+        
+        # 以全局变量数组为初始解，跑全局 SA
+        final_x_np, final_y_np, final_cost = global_sa.run(strategies=strategies, initial_vars=global_vars)
+        
+        final_x = list(final_x_np)
+        final_y = list(final_y_np)
+        
+        global_time = time.time() - t0 - elapsed_a - greedy_time
+        print(f"    全局 SA 完成: time={global_time:.1f}s")
 
     elapsed_b = time.time() - t0 - elapsed_a
     print(f"  Phase B 完成: time={elapsed_b:.1f}s")
