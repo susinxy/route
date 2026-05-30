@@ -215,30 +215,49 @@ class ConstraintSystem:
             # 方向2：如果模板 group 的 box 数过多，强制网格排列
             # 阈值：4 个 box（8 个变量），超过就固定相对位置
             if len(ref_group) > 5:
-                # 计算网格布局：按 box 顺序排列成紧凑网格
+                # 计算网格布局：尝试多种 cols 配置，选 BBox 面积最小的
                 num_boxes = len(ref_group)
-                cols = int(num_boxes ** 0.5 + 0.5)
+                
+                best_cols = 1
+                best_bbox_area = float('inf')
+                best_col_offsets = None
+                best_row_offsets = None
+                
+                for try_cols in range(1, num_boxes + 1):
+                    try_rows = (num_boxes + try_cols - 1) // try_cols
+                    
+                    # 计算每列最大宽度和每行最大高度
+                    tw = []
+                    for c in range(try_cols):
+                        indices = [r * try_cols + c for r in range(try_rows) if r * try_cols + c < num_boxes]
+                        tw.append(max(p.widths[ref_group[i]] for i in indices))
+                    
+                    th = []
+                    for r in range(try_rows):
+                        indices = [r * try_cols + c for c in range(try_cols) if r * try_cols + c < num_boxes]
+                        th.append(max(p.heights[ref_group[i]] for i in indices))
+                    
+                    bbox_w = sum(tw)
+                    bbox_h = sum(th)
+                    area = bbox_w * bbox_h
+                    
+                    if area < best_bbox_area:
+                        best_bbox_area = area
+                        best_cols = try_cols
+                        # 计算偏移
+                        co = [0.0]
+                        for c in range(1, try_cols):
+                            co.append(co[-1] + tw[c - 1])
+                        ro = [0.0]
+                        for r in range(1, try_rows):
+                            ro.append(ro[-1] + th[r - 1])
+                        best_col_offsets = co
+                        best_row_offsets = ro
+                
+                cols = best_cols
                 rows = (num_boxes + cols - 1) // cols
-                
-                # 计算每列最大宽度和每行最大高度
-                col_widths = []
-                for c in range(cols):
-                    indices = [r * cols + c for r in range(rows) if r * cols + c < num_boxes]
-                    col_widths.append(max(p.widths[ref_group[i]] for i in indices))
-                
-                row_heights = []
-                for r in range(rows):
-                    indices = [r * cols + c for c in range(cols) if r * cols + c < num_boxes]
-                    row_heights.append(max(p.heights[ref_group[i]] for i in indices))
-                
-                # 计算每列 X 偏移和每行 Y 偏移
-                col_offsets = [0.0]
-                for c in range(1, cols):
-                    col_offsets.append(col_offsets[-1] + col_widths[c - 1])
-                
-                row_offsets = [0.0]
-                for r in range(1, rows):
-                    row_offsets.append(row_offsets[-1] + row_heights[r - 1])
+                col_offsets = best_col_offsets
+                row_offsets = best_row_offsets
                 
                 # 模板 group 的第一个 box 作为锚点 (x0, y0)
                 anchor_box = ref_group[0]
