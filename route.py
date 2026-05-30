@@ -1204,6 +1204,437 @@ def _compress_layout(problem: Problem, cs: ConstraintSystem,
 
 
 # ============================================================
+# 两阶段分区布局 (Partitioned Placement)
+# ============================================================
+
+def _get_constrained_boxes(problem: Problem) -> Set[int]:
+    """返回所有受几何约束的 box 索引 (0-indexed)"""
+    constrained = set()
+    for group in problem.sym_x_groups:
+        for pair in group.get('symmetry_pair', []):
+            constrained.update(b-1 for b in pair)
+        for s in group.get('self_symmetry', []):
+            constrained.add(s-1)
+    for group in problem.sym_y_groups:
+        for pair in group.get('symmetry_pair', []):
+            constrained.update(b-1 for b in pair)
+        for s in group.get('self_symmetry', []):
+            constrained.add(s-1)
+    for group_list in [problem.align_left, problem.align_right,
+                       problem.align_top, problem.align_bottom]:
+        for group in group_list:
+            constrained.update(b-1 for b in group)
+    for rg in problem.repeat_groups:
+        for grp in rg:
+            constrained.update(b-1 for b in grp)
+    return constrained
+
+
+def _build_sub_problem(problem: Problem, constrained: Set[int]) -> Dict:
+    """构建只含约束 box 的子问题，重新索引"""
+    clist = sorted(constrained)
+    old2new = {old: new for new, old in enumerate(clist)}
+    cset = set(clist)
+
+    sub_sizes = [[problem.widths[i], problem.heights[i]] for i in clist]
+
+    def remap_sym(groups):
+        result = []
+        for g in groups:
+            ng = {'symmetry_pair': [], 'self_symmetry': []}
+            for pair in g.get('symmetry_pair', []):
+                a, b = pair[0]-1, pair[1]-1
+                if a in cset and b in cset:
+                    ng['symmetry_pair'].append([old2new[a]+1, old2new[b]+1])
+            for s in g.get('self_symmetry', []):
+                si = s-1
+                if si in cset:
+                    ng['self_symmetry'].append(old2new[si]+1)
+            if ng['symmetry_pair'] or ng['self_symmetry']:
+                result.append(ng)
+        return result
+
+    def remap_align(align_groups):
+        result = []
+        for group in align_groups:
+            boxes = [b-1 for b in group if b-1 in cset]
+            if len(boxes) >= 2:
+                result.append([old2new[b]+1 for b in boxes])
+        return result
+
+    def remap_repeat(rg_list):
+        result = []
+        for rg in rg_list:
+            new_groups = []
+            valid = True
+            for grp in rg:
+                boxes = [b-1 for b in grp]
+                if not all(b in cset for b in boxes):
+                    valid = False
+                    break
+                new_groups.append([old2new[b]+1 for b in boxes])
+            if valid and len(new_groups) >= 2:
+                result.append({'groups': new_groups})
+        return result
+
+    def remap_nets(nets):
+        result = []
+        for net in nets:
+            boxes = [b-1 for b in net]
+            relevant = [old2new[b]+1 for b in boxes if b in cset]
+            if len(relevant) >= 2:
+                result.append(relevant)
+        return result
+
+    sub_align = {}
+    for key in ['left', 'right', 'top', 'bottom']:
+        sub_align[key] = remap_align(getattr(problem, f'align_{key}', []))
+
+    return {
+        'box_size': sub_sizes,
+        'symmetry_x': remap_sym(problem.sym_x_groups),
+        'symmetry_y': remap_sym(problem.sym_y_groups),
+        'repeat_groups': remap_repeat(problem.repeat_groups),
+        'align': sub_align,
+        'nets': remap_nets(problem.nets),
+    }
+
+
+def _classify_free_boxes(problem: Problem, constrained_set: Set[int], free_boxes: list):
+    """将 free box 分为三类: cross_net, free_net, isolated"""
+    cross_net, free_net, isolated = [], [], []
+    for fb in free_boxes:
+        fb_id = fb + 1  # 1-indexed
+        has_cross = False
+        has_free = False
+        for net in problem.nets:
+            if fb_id in net:
+                for b in net:
+                    bi = b - 1
+                    if bi != fb and bi in constrained_set:
+                        has_cross = True
+                        break
+                if not has_cross:
+                    for b in net:
+                        bi = b - 1
+                        if bi != fb and bi not in constrained_set:
+                            has_free = True
+                            break
+            if has_cross:
+                break
+        if has_cross:
+            cross_net.append(fb)
+        elif has_free:
+            free_net.append(fb)
+        else:
+            isolated.append(fb)
+    return cross_net, free_net, isolated
+
+
+def _find_whitespace_slots(placed, bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y):
+    """扫描 BBox 内的空白矩形区域，返回 [(x, y, w, h), ...]"""
+    slots = []
+    margin = OVERLAP_MARGIN
+    for (px, py, pw, ph, _) in placed:
+        # 右侧空位
+        rx = px + pw + margin
+        if rx < bbox_max_x:
+            rw = bbox_max_x - rx
+            if rw > 0:
+                slots.append((rx, bbox_min_y, rw, bbox_max_y - bbox_min_y))
+        # 左侧空位
+        lw = px - margin - bbox_min_x
+        if lw > 0:
+            slots.append((bbox_min_x, bbox_min_y, lw, bbox_max_y - bbox_min_y))
+        # 上方空位
+        ty = py + ph + margin
+        if ty < bbox_max_y:
+            th = bbox_max_y - ty
+            if th > 0:
+                slots.append((bbox_min_x, ty, bbox_max_x - bbox_min_x, th))
+        # 下方空位
+        bh = py - margin - bbox_min_y
+        if bh > 0:
+            slots.append((bbox_min_x, bbox_min_y, bbox_max_x - bbox_min_x, bh))
+
+    # 过滤：检查 slot 中心是否与任何已放置 box 重叠
+    valid_slots = []
+    for (sx, sy, sw, sh) in slots:
+        if sw <= 0 or sh <= 0:
+            continue
+        cx = sx + sw / 2
+        cy = sy + sh / 2
+        ok = True
+        for (px, py, pw, ph, _) in placed:
+            if px <= cx <= px + pw and py <= cy <= py + ph:
+                ok = False
+                break
+        if ok:
+            valid_slots.append((sx, sy, sw, sh))
+
+    valid_slots.sort(key=lambda s: s[2] * s[3], reverse=True)
+    return valid_slots
+
+
+def _place_free_box_smart(problem: Problem, fb: int, box_type: str,
+                           placed: list,
+                           bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y,
+                           constrained_set: Set[int]) -> Tuple[float, float]:
+    """智能放置 free box: 先找空位，再填坑"""
+    w = float(problem.w_arr[fb])
+    h = float(problem.h_arr[fb])
+    fb_id = fb + 1
+
+    cur_bbox_area = max(1.0, (bbox_max_x - bbox_min_x) * (bbox_max_y - bbox_min_y))
+
+    candidates = []
+
+    # 1. Whitespace slots（BBox 内空位）
+    slots = _find_whitespace_slots(placed, bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y)
+    for (sx, sy, sw, sh) in slots[:15]:
+        if sw >= w and sh >= h:
+            candidates.append((sx, sy))
+            candidates.append((sx + sw - w, sy))
+            candidates.append((sx, sy + sh - h))
+            candidates.append((sx + sw - w, sy + sh - h))
+            candidates.append((sx + (sw - w) / 2, sy + (sh - h) / 2))
+
+    # 2. 已放置 box 的边缘（紧贴放置）
+    for (px, py, pw, ph, _) in placed:
+        candidates.append((px + pw + OVERLAP_MARGIN, py))
+        candidates.append((px - w - OVERLAP_MARGIN, py))
+        candidates.append((px, py + ph + OVERLAP_MARGIN))
+        candidates.append((px, py - h - OVERLAP_MARGIN))
+
+    # 3. 对 cross_net / free_net，找 connected box 附近
+    if box_type in ("cross_net", "free_net"):
+        connected_centers = []
+        for net in problem.nets:
+            if fb_id in net:
+                for b in net:
+                    bi = b - 1
+                    if bi != fb:
+                        for (px, py, pw, ph, pidx) in placed:
+                            if pidx == bi:
+                                connected_centers.append((px + pw/2, py + ph/2))
+        if connected_centers:
+            avg_cx = sum(c[0] for c in connected_centers) / len(connected_centers)
+            avg_cy = sum(c[1] for c in connected_centers) / len(connected_centers)
+            for dx in [-2, -1, 0, 1, 2]:
+                for dy in [-2, -1, 0, 1, 2]:
+                    candidates.append((avg_cx - w/2 + dx * w, avg_cy - h/2 + dy * h))
+
+    # 评估每个候选
+    best_pos = (bbox_max_x + OVERLAP_MARGIN, bbox_min_y)  # fallback
+    best_score = float('inf')
+
+    for (cx, cy) in candidates:
+        # 检查重叠
+        overlap = False
+        for (px, py, pw, ph, _) in placed:
+            ox = max(0, min(cx + w, px + pw) - max(cx, px))
+            oy = max(0, min(cy + h, py + ph) - max(cy, py))
+            if ox * oy > 0.001:
+                overlap = True
+                break
+        if overlap:
+            continue
+
+        # 计算 BBox 扩张
+        new_min_x = min(bbox_min_x, cx)
+        new_min_y = min(bbox_min_y, cy)
+        new_max_x = max(bbox_max_x, cx + w)
+        new_max_y = max(bbox_max_y, cy + h)
+        new_W = new_max_x - new_min_x
+        new_H = new_max_y - new_min_y
+        new_bbox_area = new_W * new_H
+        area_delta = max(0, new_bbox_area - cur_bbox_area)
+
+        # 形状惩罚：偏离正方形越远，惩罚越大
+        aspect_ratio = max(new_W, new_H) / max(1.0, min(new_W, new_H))
+        shape_penalty = (aspect_ratio - 1.0) ** 2
+
+        # 计算 HPWL 贡献
+        hpwl_contrib = 0.0
+        for net in problem.nets:
+            if fb_id in net:
+                xs = [cx + w/2]
+                ys = [cy + h/2]
+                for b in net:
+                    bi = b - 1
+                    if bi != fb:
+                        for (px, py, pw, ph, pidx) in placed:
+                            if pidx == bi:
+                                xs.append(px + pw/2)
+                                ys.append(py + ph/2)
+                if len(xs) > 1:
+                    hpwl_contrib += (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+        # 统一评分: hpwl + alpha*area_delta + beta*shape_penalty
+        # HPWL 最优先：同 net 靠近
+        # area_delta 次优先：不同 net 可嵌套
+        # shape_penalty：鼓励正方形布局
+        score = hpwl_contrib + 1.0 * area_delta + 50.0 * shape_penalty
+        if score < best_score:
+            best_score = score
+            best_pos = (cx, cy)
+
+    return best_pos
+
+
+def _partitioned_solve(problem: Problem, time_limit: float = 115.0,
+                       strategies: List[str] = None):
+    """
+    两阶段分区布局:
+    Phase A: 只优化约束 box (低维空间 SA)
+    Phase B: 贪心初始化 + SA 精炼 free box
+    """
+    t0 = time.time()
+
+    constrained = _get_constrained_boxes(problem)
+    n = problem.n
+    free_boxes = sorted(set(range(n)) - constrained)
+
+    print(f"分区布局: {len(constrained)} constrained, {len(free_boxes)} free")
+
+    # 如果约束 box 太少或太多，不分区
+    if len(constrained) < 4 or len(constrained) > n * 0.8:
+        print(f"  约束 box 比例不适合分区，使用标准求解")
+        return None
+
+    # Phase A: 构建子问题并求解
+    sub_data = _build_sub_problem(problem, constrained)
+    sub_problem = Problem(sub_data)
+    sub_cs = ConstraintSystem(sub_problem)
+
+    clist = sorted(constrained)
+    sub_n_free = len(sub_cs.free_vars)
+    print(f"  Phase A: {len(clist)} constrained boxes -> {sub_n_free} free vars "
+          f"(vs full {len(ConstraintSystem(problem).free_vars)})")
+
+    sub_sa = SimulatedAnnealing(sub_problem, sub_cs,
+                                time_limit=time_limit * 0.4)
+    sub_x, sub_y, sub_cost = sub_sa.run(strategies=strategies)
+
+    # 后处理
+    remaining = time_limit * 0.4 - (time.time() - t0)
+    if remaining > 1.0:
+        sub_x, sub_y = _postprocess(sub_problem, sub_cs, sub_x, sub_y,
+                                     remaining_time=remaining)
+
+    elapsed_a = time.time() - t0
+    sub_hpwl = compute_hpwl(sub_problem, sub_x, sub_y)
+    sub_area = compute_area(sub_problem, sub_x, sub_y)
+    print(f"  Phase A 完成: cost={10*sub_hpwl+sub_area:.1f}, "
+          f"hpwl={sub_hpwl:.1f}, area={sub_area:.1f}, time={elapsed_a:.1f}s")
+
+    # bbox expansion 会破坏对称/自对称约束，已移除
+    # Phase B 的 smart placement 会在 bbox 外自动找空位放置 free boxes
+
+    # Phase B: 分策略智能放置 free boxes (Whitespace Management)
+    phase_b_budget = time_limit * 0.5
+    print(f"  Phase B: 放置 {len(free_boxes)} 个 free boxes "
+          f"(budget={phase_b_budget:.0f}s)")
+
+    # 初始化全坐标数组
+    final_x = [0.0] * n
+    final_y = [0.0] * n
+
+    # 填入约束 box 坐标
+    old2new = {old: new for new, old in enumerate(clist)}
+    for i, old_idx in enumerate(clist):
+        final_x[old_idx] = sub_x[i]
+        final_y[old_idx] = sub_y[i]
+
+    # 分类 free box
+    cross_net, free_net, isolated = _classify_free_boxes(problem, constrained, free_boxes)
+    print(f"    分类: cross_net={len(cross_net)}, free_net={len(free_net)}, isolated={len(isolated)}")
+
+    # 构建已放置 box 列表: [(x, y, w, h, global_idx), ...]
+    placed = []
+    for c in constrained:
+        placed.append((final_x[c], final_y[c], float(problem.w_arr[c]), float(problem.h_arr[c]), c))
+
+    # 当前 BBox
+    b_min_x = min(p[0] for p in placed)
+    b_min_y = min(p[1] for p in placed)
+    b_max_x = max(p[0] + p[2] for p in placed)
+    b_max_y = max(p[1] + p[3] for p in placed)
+
+    def _update_bbox(pos, bw, bh):
+        nonlocal b_min_x, b_min_y, b_max_x, b_max_y
+        b_min_x = min(b_min_x, pos[0])
+        b_min_y = min(b_min_y, pos[1])
+        b_max_x = max(b_max_x, pos[0] + bw)
+        b_max_y = max(b_max_y, pos[1] + bh)
+
+    # Step 1: 放置 cross_net free box
+    for fb in cross_net:
+        pos = _place_free_box_smart(problem, fb, "cross_net", placed,
+                                     b_min_x, b_min_y, b_max_x, b_max_y, constrained)
+        final_x[fb] = pos[0]
+        final_y[fb] = pos[1]
+        bw, bh = float(problem.w_arr[fb]), float(problem.h_arr[fb])
+        placed.append((pos[0], pos[1], bw, bh, fb))
+        _update_bbox(pos, bw, bh)
+
+    # Step 2: 放置 free_net (按 net 聚类，同 net 的先放一起)
+    visited = set()
+    net_groups = []
+    for fb in free_net:
+        if fb in visited:
+            continue
+        group = {fb}
+        fb_id = fb + 1
+        for net in problem.nets:
+            if fb_id in net:
+                for b in net:
+                    bi = b - 1
+                    if bi in free_net and bi not in visited:
+                        group.add(bi)
+        net_groups.append(sorted(group))
+        visited.update(group)
+
+    for group in net_groups:
+        for fb in group:
+            pos = _place_free_box_smart(problem, fb, "free_net", placed,
+                                         b_min_x, b_min_y, b_max_x, b_max_y, constrained)
+            final_x[fb] = pos[0]
+            final_y[fb] = pos[1]
+            bw, bh = float(problem.w_arr[fb]), float(problem.h_arr[fb])
+            placed.append((pos[0], pos[1], bw, bh, fb))
+            _update_bbox(pos, bw, bh)
+
+    # Step 3: 放置 isolated (纯填空，按面积从大到小)
+    isolated_sorted = sorted(isolated,
+                              key=lambda fb: float(problem.w_arr[fb]) * float(problem.h_arr[fb]),
+                              reverse=True)
+    for fb in isolated_sorted:
+        pos = _place_free_box_smart(problem, fb, "isolated", placed,
+                                     b_min_x, b_min_y, b_max_x, b_max_y, constrained)
+        final_x[fb] = pos[0]
+        final_y[fb] = pos[1]
+        bw, bh = float(problem.w_arr[fb]), float(problem.h_arr[fb])
+        placed.append((pos[0], pos[1], bw, bh, fb))
+        _update_bbox(pos, bw, bh)
+
+    elapsed_b = time.time() - t0 - elapsed_a
+    print(f"  Phase B 完成: time={elapsed_b:.1f}s")
+
+    # 计算最终指标
+    final_hpwl = compute_hpwl(problem, final_x, final_y)
+    final_area = compute_area(problem, final_x, final_y)
+    final_overlap = compute_overlap_penalty(problem, final_x, final_y)
+    final_cost = 10 * final_hpwl + final_area
+
+    print(f"  最终: cost={final_cost:.1f}, hpwl={final_hpwl:.1f}, "
+          f"area={final_area:.1f}, overlap={final_overlap:.2f}")
+
+    elapsed = time.time() - t0
+    return final_x, final_y, elapsed
+
+
+# ============================================================
 # 求解入口
 # ============================================================
 
@@ -1221,6 +1652,14 @@ def solve(problem: Problem, time_limit: float = 115.0,
         dict with keys: box_position, cost, hpwl, area, overlap, elapsed_seconds
     """
     t0 = time.time()
+
+    # 尝试分区求解（降维优化）
+    try:
+        result = _partitioned_solve(problem, time_limit, strategies)
+        if result is not None:
+            return result
+    except Exception as e:
+        print(f"  分区求解失败，回退标准流程: {e}")
 
     # 1. 约束化简
     cs = ConstraintSystem(problem)

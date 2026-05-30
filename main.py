@@ -1301,6 +1301,12 @@ def run_case_test(filepath: str, time_limit: float = 115.0,
     input_data = data.get("input", data)
     desc = data.get("description", case_name)
 
+    # Auto-derive viz_dir for basic/advanced cases
+    if viz_dir == 'visualizations':
+        parent_dir = os.path.basename(os.path.normpath(os.path.dirname(filepath)))
+        if parent_dir in ('basic', 'advanced'):
+            viz_dir = os.path.join('visualizations', parent_dir)
+
     result = {
         "case": case_name,
         "description": desc,
@@ -1800,10 +1806,17 @@ def _handle_directory_mode(config: Dict[str, Any]):
         sys.exit(1)
     
     if use_test_mode:
+        # Auto-derive viz_dir from test case directory when using default
+        viz_dir = config['viz_dir']
+        if viz_dir == 'visualizations':
+            # e.g. test_cases/advanced/ -> visualizations/advanced/
+            dir_basename = os.path.basename(os.path.normpath(directory))
+            if dir_basename in ('basic', 'advanced'):
+                viz_dir = os.path.join('visualizations', dir_basename)
         # Test mode
         _run_test_suite(cases, config['time_limit'], config['expected_only'],
                         config['verbose'], config['parallel'], config['max_workers'],
-                        config['visualize'], config['viz_dir'])
+                        config['visualize'], viz_dir)
     else:
         # Run mode
         return cases
